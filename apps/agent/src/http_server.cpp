@@ -49,7 +49,7 @@ void HttpServer::Run(const std::function<bool()>& stop_requested) {
         throw std::runtime_error("acceptor set_option failed: " + error.message());
     }
 
-    acceptor.bind({address, options_.bind_port}, error);
+    acceptor.bind({address, options_.port}, error);
     if (error) {
         throw std::runtime_error("acceptor bind failed: " + error.message());
     }

@@ -11,7 +11,7 @@
 namespace aegis::agent {
 struct HttpServerOptions {
     std::string bind_address{"127.0.0.1"};
-    unsigned short bind_port{18081};
+    unsigned short port{18081};
 };
 
 class HttpServer {

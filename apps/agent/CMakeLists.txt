@@ -10,6 +10,9 @@ add_executable(agent main.cpp
         include/agent/process_supervisor.h
         include/agent/log_reader.h
         include/agent/http_json.h
+        include/agent/service_definition.h
+        src/service_registry.cpp
+        include/agent/service_registry.h
 )
 
 target_include_directories(agent PRIVATE include)

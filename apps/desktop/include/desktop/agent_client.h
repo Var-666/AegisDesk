@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QJsonObject>
+#include <QList>
 #include <QNetworkAccessManager>
 #include <QObject>
 #include <QString>
@@ -10,19 +12,23 @@
 #include <optional>
 
 namespace aegis::desktop {
+
 struct AgentError {
     int http_status{0};
     QString code;
     QString message;
 
-    bool Ok() const {
+    [[nodiscard]] bool Ok() const {
         return message.isEmpty();
     }
 };
 
 struct ServiceSnapshot {
-    QString name;
+    QString id;
+    QString display_name;
     QString state;
+
+    bool auto_start{false};
 
     qint64 pid{-1};
     qint64 uptime_seconds{0};
@@ -33,21 +39,26 @@ struct ServiceSnapshot {
 class AgentClient final : public QObject {
 public:
     using StatusCallback = std::function<void(std::optional<ServiceSnapshot>, AgentError)>;
+
+    using ServiceListCallback = std::function<void(std::optional<QList<ServiceSnapshot>>, AgentError)>;
+
     using LogsCallback = std::function<void(std::optional<QStringList>, AgentError)>;
 
     explicit AgentClient(QUrl base_url, QObject* parent = nullptr);
 
-    void GetStatus(StatusCallback callback);
+    void GetServices(ServiceListCallback callback);
 
-    void StartService(StatusCallback callback);
+    void GetStatus(const QString& service_id, StatusCallback callback);
 
-    void StopService(StatusCallback callback);
+    void StartService(const QString& service_id, StatusCallback callback);
 
-    void RestartService(StatusCallback callback);
+    void StopService(const QString& service_id, StatusCallback callback);
 
-    void GetLogs(int tail, LogsCallback callback);
+    void RestartService(const QString& service_id, StatusCallback callback);
 
-    QUrl BaseUrl() const;
+    void GetLogs(const QString& service_id, int tail, LogsCallback callback);
+
+    [[nodiscard]] QUrl BaseUrl() const;
 
 private:
     enum class HttpMethod {
@@ -57,17 +68,19 @@ private:
 
     using JsonCallback = std::function<void(std::optional<QJsonObject>, AgentError)>;
 
-    void RequestStatus(HttpMethod method, const QString& path, StatusCallback callback);
+    void RequestStatus(HttpMethod method, const QString& service_id, const QString& action, StatusCallback callback);
 
     void SendJsonRequest(HttpMethod method, const QUrl& url, JsonCallback callback);
 
-    QUrl BuildUrl(const QString& path) const;
+    [[nodiscard]] QUrl BuildUrl(const QString& path) const;
 
-    static std::optional<ServiceSnapshot> ParseServiceSnapshot(const QJsonObject& object);
+    [[nodiscard]] QUrl BuildServiceUrl(const QString& service_id, const QString& action) const;
 
-    static AgentError ParseError(int http_status, const QJsonObject& object, const QString& fallback_message);
+    [[nodiscard]] static std::optional<ServiceSnapshot> ParseServiceSnapshot(const QJsonObject& object);
 
-private:
+    [[nodiscard]] static AgentError ParseError(int http_status, const QJsonObject& object,
+                                               const QString& fallback_message);
+
     QUrl base_url_;
     QNetworkAccessManager network_manager_;
 };

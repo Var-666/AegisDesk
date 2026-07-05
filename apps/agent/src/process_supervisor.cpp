@@ -22,10 +22,15 @@ std::string ToString(const ServiceState state) {
     }
     return "Unknown";
 }
-ProcessSupervisor::ProcessSupervisor(const std::filesystem::path& service_path, const std::filesystem::path& work_dir)
-    : service_path_(std::filesystem::absolute(service_path))
-    , work_dir_(std::filesystem::absolute(work_dir)) {}
 
+ProcessSupervisor::ProcessSupervisor(ServiceDefinition definition)
+    : definition_(std::move(definition)) {
+    if (definition_.IsStructurallyValid()) {
+        definition_.executable = std::filesystem::absolute(definition_.executable);
+        definition_.work_dir = std::filesystem::absolute(definition_.work_dir);
+        definition_.log_path = std::filesystem::absolute(definition_.log_path);
+    }
+}
 ProcessSupervisor::~ProcessSupervisor() noexcept {
     std::string error;
 
@@ -39,15 +44,50 @@ bool ProcessSupervisor::Start(std::string& error) {
     error.clear();
     ReapExitedChildLocked();
 
+    if (!definition_.IsStructurallyValid()) {
+        error = "invalid service definition: " + definition_.id;
+        return false;
+    }
+
     if (pid_ > 0) {
         error = "demo_service is already running";
         return false;
     }
 
-    if (!std::filesystem::exists(service_path_)) {
-        error = "service executable does not exist: " + service_path_.string();
+    if (!std::filesystem::exists(definition_.executable)) {
+        error = "service executable does not exist: " + definition_.executable.string();
         return false;
     }
+
+    if (!std::filesystem::exists(definition_.work_dir) || !std::filesystem::is_directory(definition_.work_dir)) {
+        error = "service work directory does not exist or is not a directory: " + definition_.work_dir.string();
+        return false;
+    }
+
+    // execv() 需要 C 风格 argv：
+    // argv[0] = executable
+    // argv[1..n] = ServiceDefinition.args
+    // argv[n + 1] = nullptr
+    std::vector<std::string> argv_storage;
+    argv_storage.reserve(1 + definition_.args.size());
+    argv_storage.push_back(definition_.executable.string());
+
+    for (const std::string& argument : definition_.args) {
+        argv_storage.push_back(argument);
+    }
+
+    std::vector<char*> argv;
+
+    argv.reserve(argv_storage.size() + 1);
+
+    for (std::string& argument : argv_storage) {
+        argv.push_back(argument.data());
+    }
+
+    argv.push_back(nullptr);
+
+    const std::string executable_path = definition_.executable.string();
+    const std::string work_dir = definition_.work_dir.string();
 
     const pid_t child_pid = fork();
 
@@ -57,7 +97,7 @@ bool ProcessSupervisor::Start(std::string& error) {
     }
 
     if (child_pid == 0) {
-        if (chdir(work_dir_.c_str()) != 0) {
+        if (chdir(work_dir.c_str()) != 0) {
             std::cerr << "agent child: chdir failed: " << std::strerror(errno) << '\n';
             _exit(127);
         }
@@ -65,9 +105,7 @@ bool ProcessSupervisor::Start(std::string& error) {
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
 
-        const std::string program_name = service_path_.filename().string();
-
-        execl(service_path_.c_str(), program_name.c_str(), static_cast<char*>(nullptr));
+        execv(executable_path.c_str(), argv.data());
 
         _exit(127);
     }
@@ -161,6 +199,9 @@ ServiceStatus ProcessSupervisor::GetStatus() {
     }
 
     return status;
+}
+const ServiceDefinition& ProcessSupervisor::Definition() const noexcept {
+    return definition_;
 }
 bool ProcessSupervisor::ReapExitedChildLocked() {
     if (pid_ <= 0) {

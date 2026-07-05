@@ -1,8 +1,6 @@
-//
-// Created by Var on 2026/7/3.
-//
-
 #pragma once
+
+#include "agent/service_definition.h"
 
 #include <chrono>
 #include <filesystem>
@@ -29,7 +27,7 @@ struct ServiceStatus {
 
 class ProcessSupervisor {
 public:
-    ProcessSupervisor(const std::filesystem::path& service_path, const std::filesystem::path& work_dir);
+    ProcessSupervisor(ServiceDefinition definition);
 
     ~ProcessSupervisor() noexcept;
 
@@ -42,12 +40,13 @@ public:
 
     [[nodiscard]] ServiceStatus GetStatus();
 
+    [[nodiscard]] const ServiceDefinition& Definition() const noexcept;
+
 private:
     bool ReapExitedChildLocked();
     void SaveExitStatusLocked(int status);
 
-    std::filesystem::path service_path_;
-    std::filesystem::path work_dir_;
+    ServiceDefinition definition_;
 
     std::mutex mutex_;
 

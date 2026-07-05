@@ -1,6 +1,6 @@
 #include "agent/agent_api.h"
 #include "agent/http_server.h"
-#include "agent/process_supervisor.h"
+#include "agent/service_registry.h"
 
 #include <charconv>
 #include <csignal>
@@ -19,7 +19,7 @@ extern "C" void HandleSignal(int) {
 }
 
 struct AgentOptions {
-    std::filesystem::path service_path{"build/apps/demo_service/demo_service"};
+    std::filesystem::path config_path{"configs/services.json"};
 
     std::filesystem::path work_dir{"."};
 
@@ -28,7 +28,7 @@ struct AgentOptions {
 
 void PrintUsage() {
     std::cout << "Usage: agent "
-              << "[--service PATH] "
+              << "[--config PATH] "
               << "[--work-dir PATH] "
               << "[--port PORT]\n";
 }
@@ -39,9 +39,10 @@ std::optional<AgentOptions> ParseArgs(const int argc, char* argv[]) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
 
-        const auto read_value = [&](const std::string_view name) -> std::optional<std::string_view> {
+        const auto read_value = [&](const std::string_view option_name) -> std::optional<std::string_view> {
             if (index + 1 >= argc) {
-                std::cerr << name << " requires a value\n";
+                std::cerr << option_name << " requires a value\n";
+
                 return std::nullopt;
             }
 
@@ -53,14 +54,14 @@ std::optional<AgentOptions> ParseArgs(const int argc, char* argv[]) {
             return std::nullopt;
         }
 
-        if (argument == "--service") {
+        if (argument == "--config") {
             const auto value = read_value(argument);
 
             if (!value.has_value()) {
                 return std::nullopt;
             }
 
-            options.service_path = *value;
+            options.config_path = *value;
             continue;
         }
 
@@ -84,10 +85,11 @@ std::optional<AgentOptions> ParseArgs(const int argc, char* argv[]) {
 
             unsigned int parsed = 0;
 
-            const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
+            const auto [end, parse_error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
 
-            if (error != std::errc{} || end != value->data() + value->size() || parsed == 0 || parsed > 65535) {
+            if (parse_error != std::errc{} || end != value->data() + value->size() || parsed == 0 || parsed > 65535) {
                 std::cerr << "invalid port: " << *value << '\n';
+
                 return std::nullopt;
             }
 
@@ -103,6 +105,20 @@ std::optional<AgentOptions> ParseArgs(const int argc, char* argv[]) {
     return options;
 }
 
+std::optional<std::filesystem::path> MakeAbsolutePath(const std::filesystem::path& path, const std::string_view label) {
+    std::error_code error;
+
+    const std::filesystem::path absolute_path = std::filesystem::absolute(path, error);
+
+    if (error) {
+        std::cerr << "failed to resolve " << label << ": " << error.message() << '\n';
+
+        return std::nullopt;
+    }
+
+    return absolute_path;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -112,30 +128,61 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    const std::filesystem::path work_dir = std::filesystem::absolute(options->work_dir);
+    const auto work_dir = MakeAbsolutePath(options->work_dir, "work directory");
 
-    const std::filesystem::path service_path = std::filesystem::absolute(options->service_path);
+    const auto config_path = MakeAbsolutePath(options->config_path, "config path");
 
-    const std::filesystem::path log_path = work_dir / "runtime/logs/demo_service.log";
+    if (!work_dir.has_value() || !config_path.has_value()) {
+        return 1;
+    }
+
+    if (!std::filesystem::exists(*work_dir) || !std::filesystem::is_directory(*work_dir)) {
+        std::cerr << "work directory does not exist or is not a directory: " << *work_dir << '\n';
+
+        return 1;
+    }
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
 
-    aegis::agent::ProcessSupervisor supervisor(service_path, work_dir);
+    aegis::agent::ServiceRegistry registry;
 
-    aegis::agent::AgentApi api(supervisor, log_path);
+    std::string registry_error;
+
+    if (!registry.LoadFromFile(*config_path, *work_dir, registry_error)) {
+        std::cerr << "[agent] failed to load services config: " << registry_error << '\n';
+
+        return 1;
+    }
+
+    std::cout << "AegisDesk Agent loaded " << registry.Size() << " service definitions\n";
+
+    for (const aegis::agent::ServiceSummary& service : registry.ListServices()) {
+        std::cout << "  - " << service.id << " (" << service.display_name
+                  << "), auto_start=" << (service.auto_start ? "true" : "false") << '\n';
+    }
+
+    if (!registry.StartAutoStartServices(registry_error)) {
+        // 不退出 Agent：即使某个 auto_start 服务失败，
+        // 控制面仍应保持可用，方便后续诊断。
+        std::cerr << "[agent] " << registry_error << '\n';
+    }
+
+    aegis::agent::AgentApi api(registry);
 
     try {
         aegis::agent::HttpServer server(
             {
                 .bind_address = "127.0.0.1",
-                .bind_port = options->port,
+                .port = options->port,
             },
             [&api](const aegis::agent::HttpRequest& request) { return api.Handle(request); });
 
         std::cout << "AegisDesk Agent listening on http://127.0.0.1:" << options->port << '\n';
 
-        std::cout << "managed service: " << service_path << '\n';
+        std::cout << "service config: " << *config_path << '\n';
+
+        std::cout << "path base directory: " << *work_dir << '\n';
 
         server.Run([] { return g_stop_requested != 0; });
     } catch (const std::exception& exception) {
@@ -144,10 +191,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string error;
+    std::string shutdown_error;
 
-    if (!supervisor.Stop(error)) {
-        std::cerr << "[agent] shutdown stop failed: " << error << '\n';
+    if (!registry.StopAll(shutdown_error)) {
+        std::cerr << "[agent] shutdown stop failed: " << shutdown_error << '\n';
 
         return 1;
     }

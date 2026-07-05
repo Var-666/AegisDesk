@@ -8,20 +8,22 @@
 namespace aegis::agent {
 
 class ProcessSupervisor;
+class ServiceRegistry;
 
 class AgentApi {
 public:
-    AgentApi(ProcessSupervisor& supervisor, std::filesystem::path log_path);
+    explicit AgentApi(ServiceRegistry& registry);
 
-    HttpResponse Handle(const HttpRequest& request);
-
-private:
-    HttpResponse MakeStatusResponse() const;
-    HttpResponse MakeActionResponse(std::string_view action) const;
-    HttpResponse MakeLogsResponse(std::size_t tail) const;
+    [[nodiscard]] HttpResponse Handle(const HttpRequest& request);
 
 private:
-    ProcessSupervisor& supervisor_;
-    std::filesystem::path log_path_;
+    [[nodiscard]] HttpResponse MakeServiceListResponse() const;
+    [[nodiscard]] HttpResponse MakeStatusResponse(ProcessSupervisor& supervisor);
+    [[nodiscard]] HttpResponse MakeActionResponse(ProcessSupervisor& supervisor, std::string_view action);
+    [[nodiscard]] HttpResponse MakeLogsResponse(ProcessSupervisor& supervisor, std::size_t tail);
+    [[nodiscard]] HttpResponse MakeMethodNotAllowed(std::string_view allow);
+
+private:
+    ServiceRegistry& registry_;
 };
 } // namespace aegis::agent

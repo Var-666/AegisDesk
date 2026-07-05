@@ -5,41 +5,58 @@
 #include <QMainWindow>
 #include <QTimer>
 
+class QGroupBox;
 class QLabel;
+class QListWidget;
+class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
 class QSpinBox;
 
 namespace aegis::desktop {
+
 class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(QUrl agent_url, QWidget* parent = nullptr);
 
 private:
-    using StatusOperation = void (AgentClient::*)(AgentClient::StatusCallback);
+    using StatusOperation = void (AgentClient::*)(const QString&, AgentClient::StatusCallback);
 
-    void BuildUI();
+    void BuildUi();
+
     void RefreshAll();
+    void RefreshServices();
     void RefreshStatus();
     void RefreshLogs();
+
+    void ApplyServiceList(const QList<ServiceSnapshot>& services);
+
+    void SelectService(const QString& service_id);
 
     void ExecuteAction(const QString& action_name, StatusOperation operation);
 
     void ApplySnapshot(const ServiceSnapshot& snapshot);
 
-    void UpdateActionButtons() const;
+    void ClearCurrentServiceDetails();
 
-    void ShowBackgroundError(const AgentError& error) const;
+    void UpdateActionButtons();
 
-    static QString FormatUptime(qint64 total_seconds);
+    void ShowBackgroundError(const AgentError& error);
 
-private:
+    [[nodiscard]] static QString FormatUptime(qint64 total_seconds);
+
     AgentClient agent_client_;
 
+    QListWidget* service_list_{nullptr};
+
+    QGroupBox* details_group_{nullptr};
+
     QLabel* service_name_value_{nullptr};
+    QLabel* service_id_value_{nullptr};
     QLabel* state_value_{nullptr};
     QLabel* pid_value_{nullptr};
     QLabel* uptime_value_{nullptr};
+    QLabel* auto_start_value_{nullptr};
     QLabel* last_exit_value_{nullptr};
 
     QPushButton* start_button_{nullptr};
@@ -54,12 +71,16 @@ private:
 
     bool has_snapshot_{false};
     bool action_in_flight_{false};
+    bool services_request_in_flight_{false};
     bool status_request_in_flight_{false};
     bool logs_request_in_flight_{false};
 
+    QString current_service_id_;
     QString current_state_{"unknown"};
 
+    quint64 services_generation_{0};
     quint64 status_generation_{0};
     quint64 logs_generation_{0};
 };
+
 } // namespace aegis::desktop

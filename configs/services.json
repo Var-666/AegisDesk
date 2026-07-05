@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "services": [
+    {
+      "id": "demo_service",
+      "display_name": "Demo Service",
+      "executable": "build/apps/demo_service/demo_service",
+      "work_dir": ".",
+      "args": [
+        "--name",
+        "demo_service",
+        "--interval-ms",
+        "1000"
+      ],
+      "log_path": "runtime/logs/demo_service.log",
+      "auto_start": false
+    },
+    {
+      "id": "demo_worker",
+      "display_name": "Demo Worker",
+      "executable": "build/apps/demo_service/demo_service",
+      "work_dir": ".",
+      "args": [
+        "--name",
+        "demo_worker",
+        "--interval-ms",
+        "1500"
+      ],
+      "log_path": "runtime/logs/demo_worker.log",
+      "auto_start": false
+    }
+  ]
+}
