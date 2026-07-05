@@ -1,0 +1,71 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# 缩进与换行
+UseTab: Never
+IndentWidth: 4
+TabWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 120
+
+# 大括号：K&R 风格
+# if (...) {
+#     ...
+# } else {
+#     ...
+# }
+BreakBeforeBraces: Attach
+
+# 指针、引用靠类型
+# std::string* ptr;
+# const Foo& value;
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# 类访问控制符不额外缩进
+# class Foo {
+# public:
+#     ...
+# };
+AccessModifierOffset: -4
+
+# 控制语句与函数调用格式
+SpaceBeforeParens: ControlStatements
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Empty
+
+# switch 格式
+IndentCaseLabels: true
+IndentCaseBlocks: false
+
+# 换行策略
+AlignAfterOpenBracket: Align
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: NonAssignment
+BreakConstructorInitializers: BeforeComma
+ConstructorInitializerIndentWidth: 4
+
+# 对齐：避免大量无意义空格，但保留易读性
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignOperands: Align
+AlignTrailingComments: true
+
+# include 排序
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# 注释
+ReflowComments: true
+SpacesBeforeTrailingComments: 1
+
+# C++ 特性
+Standard: c++20
+
+# 宏格式：避免把复杂宏压成一行
+IndentPPDirectives: AfterHash
