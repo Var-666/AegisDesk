@@ -15,6 +15,8 @@ class QSpinBox;
 
 namespace aegis::desktop {
 
+class MetricsHistoryPanel;
+
 class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(QUrl agent_url, QWidget* parent = nullptr);
@@ -28,6 +30,7 @@ private:
     void RefreshServices();
     void RefreshStatus();
     void RefreshLogs();
+    void RefreshMetrics();
 
     void ApplyServiceList(const QList<ServiceSnapshot>& services);
 
@@ -37,7 +40,11 @@ private:
 
     void ApplySnapshot(const ServiceSnapshot& snapshot);
 
+    void ApplyMetrics(const ServiceMetricsSnapshot& metrics);
+
     void ClearCurrentServiceDetails();
+    void ClearMetrics();
+    void ShowMetricsNotReady();
 
     void UpdateActionButtons();
 
@@ -45,11 +52,16 @@ private:
 
     [[nodiscard]] static QString FormatUptime(qint64 total_seconds);
 
+    [[nodiscard]] static QString FormatBytes(quint64 bytes);
+
+    [[nodiscard]] static QString FormatSampleTime(qint64 unix_time_milliseconds);
+
     AgentClient agent_client_;
 
     QListWidget* service_list_{nullptr};
 
     QGroupBox* details_group_{nullptr};
+    MetricsHistoryPanel* metrics_history_panel_{nullptr};
 
     QLabel* service_name_value_{nullptr};
     QLabel* service_id_value_{nullptr};
@@ -58,6 +70,13 @@ private:
     QLabel* uptime_value_{nullptr};
     QLabel* auto_start_value_{nullptr};
     QLabel* last_exit_value_{nullptr};
+
+    QLabel* metrics_status_value_{nullptr};
+    QLabel* cpu_value_{nullptr};
+    QLabel* rss_value_{nullptr};
+    QLabel* thread_count_value_{nullptr};
+    QLabel* fd_count_value_{nullptr};
+    QLabel* last_sample_value_{nullptr};
 
     QPushButton* start_button_{nullptr};
     QPushButton* stop_button_{nullptr};
@@ -74,6 +93,7 @@ private:
     bool services_request_in_flight_{false};
     bool status_request_in_flight_{false};
     bool logs_request_in_flight_{false};
+    bool metrics_request_in_flight_{false};
 
     QString current_service_id_;
     QString current_state_{"unknown"};
@@ -81,6 +101,7 @@ private:
     quint64 services_generation_{0};
     quint64 status_generation_{0};
     quint64 logs_generation_{0};
+    quint64 metrics_generation_{0};
 };
 
 } // namespace aegis::desktop

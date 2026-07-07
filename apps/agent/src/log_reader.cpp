@@ -50,7 +50,6 @@ std::vector<std::string> ReadLastLines(const std::filesystem::path& path, const 
 
     if (file_size_error) {
         error = "failed to get log file size: " + file_size_error.message();
-
         return {};
     }
 

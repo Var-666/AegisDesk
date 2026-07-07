@@ -4,11 +4,14 @@
 
 #include "agent/agent_api.h"
 #include "agent/log_reader.h"
+#include "agent/metrics_collector.h"
 #include "agent/process_supervisor.h"
+#include "agent/service_metrics.h"
 #include "agent/service_registry.h"
 
 #include <algorithm>
 #include <charconv>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -22,6 +25,9 @@ constexpr std::string_view kServicesPath{"/api/v1/services"};
 constexpr std::string_view kServicePathPrefix{"/api/v1/services/"};
 constexpr std::size_t kDefaultTailLimit = 100;
 constexpr std::size_t kMaxTailLimit = 500;
+
+constexpr std::size_t kDefaultHistoryLimit = 300;
+constexpr std::size_t kMaxHistoryLimit = 300;
 
 struct ServiceRoute {
     std::string_view service_id;
@@ -60,48 +66,65 @@ struct ServiceRoute {
         return std::nullopt;
     }
 
-    const std::string_view service_id = suffix.substr(0, slash_position);
-    const std::string_view action = suffix.substr(slash_position + 1);
-
-    // 不接受多级子路径，避免路由歧义。
-    if (action.find('/') != std::string_view::npos) {
-        return std::nullopt;
-    }
-
     return ServiceRoute{
-        .service_id = service_id,
-        .action = action,
+        .service_id = suffix.substr(0, slash_position),
+        .action = suffix.substr(slash_position + 1),
     };
 }
 
-[[nodiscard]] std::size_t ParseTailLimit(const std::string_view target) {
+[[nodiscard]] std::size_t ParseBoundedPositiveQueryParameter(const std::string_view target,
+                                                             const std::string_view expected_key,
+                                                             const std::size_t default_value,
+                                                             const std::size_t maximum_value) {
     const std::size_t query_position = target.find('?');
 
     if (query_position == std::string_view::npos) {
-        return kDefaultTailLimit;
+        return default_value;
     }
 
-    const std::string_view query = target.substr(query_position + 1);
-    constexpr std::string_view key{"tail="};
-    const std::size_t key_position = query.find(key);
+    std::string_view remaining = target.substr(query_position + 1);
 
-    if (key_position == std::string_view::npos) {
-        return kDefaultTailLimit;
+    while (!remaining.empty()) {
+        const std::size_t separator_position = remaining.find('&');
+
+        const std::string_view pair = remaining.substr(0, separator_position);
+
+        const std::size_t equals_position = pair.find('=');
+
+        if (equals_position != std::string_view::npos) {
+            const std::string_view key = pair.substr(0, equals_position);
+
+            const std::string_view value = pair.substr(equals_position + 1);
+
+            if (key == expected_key) {
+                std::size_t parsed = 0;
+
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+
+                if (error != std::errc{} || end != value.data() + value.size()) {
+                    return default_value;
+                }
+
+                return std::clamp(parsed, std::size_t{1}, maximum_value);
+            }
+        }
+
+        if (separator_position == std::string_view::npos) {
+            break;
+        }
+
+        remaining.remove_prefix(separator_position + 1);
     }
 
-    const std::string_view value = query.substr(key_position + key.size());
-    const std::size_t separator_position = value.find('&');
-    const std::string_view token = value.substr(0, separator_position);
+    return default_value;
+}
 
-    std::size_t parsed = 0;
+[[nodiscard]] std::size_t ParseTailLimit(const std::string_view target) {
+    return ParseBoundedPositiveQueryParameter(target, "tail", kDefaultTailLimit, kMaxTailLimit);
+}
 
-    const auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), parsed);
-
-    if (error != std::errc{} || end != token.data() + token.size()) {
-        return kDefaultTailLimit;
-    }
-
-    return std::clamp(parsed, std::size_t{1}, kMaxTailLimit);
+[[nodiscard]] std::size_t ParseHistoryLimit(const std::string_view target) {
+    return ParseBoundedPositiveQueryParameter(target, "limit", kDefaultHistoryLimit, kMaxHistoryLimit);
 }
 
 void AppendStatusFields(std::ostringstream& body, const ServiceStatus& status) {
@@ -114,10 +137,29 @@ void AppendStatusFields(std::ostringstream& body, const ServiceStatus& status) {
         body << "null";
     }
 }
+
+void AppendOptionalDouble(std::ostringstream& body, const std::optional<double>& value) {
+    if (!value.has_value()) {
+        body << "null";
+        return;
+    }
+
+    body << std::setprecision(8) << *value;
+}
+
+void AppendOptionalUint64(std::ostringstream& body, const std::optional<std::uint64_t>& value) {
+    if (!value.has_value()) {
+        body << "null";
+        return;
+    }
+
+    body << *value;
+}
 } // namespace
 
-AgentApi::AgentApi(ServiceRegistry& registry)
-    : registry_(registry) {}
+AgentApi::AgentApi(ServiceRegistry& registry, MetricsCollector& metrics_collector)
+    : registry_(registry)
+    , metrics_collector_(metrics_collector) {}
 HttpResponse AgentApi::Handle(const HttpRequest& request) {
     const std::string_view target = RequestTarget(request);
     const std::string_view path = PathOnly(target);
@@ -161,6 +203,21 @@ HttpResponse AgentApi::Handle(const HttpRequest& request) {
             return MakeMethodNotAllowed("GET");
         }
         return MakeLogsResponse(*supervisor, ParseTailLimit(target));
+    }
+
+    if (route->action == "metrics/history") {
+        if (request.method() != http::verb::get) {
+            return MakeMethodNotAllowed("GET");
+        }
+
+        return MakeMetricsHistoryResponse(*supervisor, ParseHistoryLimit(target));
+    }
+
+    if (route->action == "metrics") {
+        if (request.method() != http::verb::get) {
+            return MakeMethodNotAllowed("GET");
+        }
+        return MakeMetricsResponse(*supervisor);
     }
 
     if (route->action == "start" || route->action == "stop" || route->action == "restart") {
@@ -255,6 +312,97 @@ HttpResponse AgentApi::MakeLogsResponse(ProcessSupervisor& supervisor, const std
             body << ',';
         }
         body << '"' << JsonEscape(lines[index]) << '"';
+    }
+
+    body << "]}";
+
+    return MakeJsonResponse(http::status::ok, body.str());
+}
+HttpResponse AgentApi::MakeMetricsResponse(ProcessSupervisor& supervisor) {
+    const ServiceDefinition& definition = supervisor.Definition();
+
+    const std::optional<ServiceMetrics> metrics = metrics_collector_.GetLatest(definition.id);
+
+    // Agent 刚启动且后台采集器尚未完成第一轮采样时，
+    // 服务存在，但暂时没有指标快照。
+    if (!metrics.has_value()) {
+        return MakeErrorResponse(http::status::service_unavailable, "metrics_not_ready",
+                                 "metrics collector has not produced a snapshot yet");
+    }
+
+    if (metrics->service_id != definition.id || !metrics->IsStructurallyValid()) {
+        return MakeErrorResponse(http::status::internal_server_error, "invalid_metrics_cache",
+                                 "metrics collector returned an invalid cached snapshot");
+    }
+
+    std::ostringstream body;
+
+    body << "{\"service_id\":\"" << JsonEscape(metrics->service_id)
+         << "\",\"available\":" << (metrics->available ? "true" : "false") << ",\"pid\":" << metrics->pid
+         << ",\"collected_at_unix_ms\":" << metrics->collected_at_unix_ms << ",\"cpu_percent\":";
+
+    AppendOptionalDouble(body, metrics->cpu_percent);
+
+    body << ",\"rss_bytes\":";
+
+    AppendOptionalUint64(body, metrics->rss_bytes);
+
+    body << ",\"thread_count\":";
+
+    AppendOptionalUint64(body, metrics->thread_count);
+
+    body << ",\"fd_count\":";
+
+    AppendOptionalUint64(body, metrics->fd_count);
+
+    body << '}';
+
+    return MakeJsonResponse(http::status::ok, body.str());
+}
+HttpResponse AgentApi::MakeMetricsHistoryResponse(ProcessSupervisor& supervisor, const std::size_t limit) {
+    const ServiceDefinition& definition = supervisor.Definition();
+
+    const std::optional<std::vector<ServiceMetrics>> history = metrics_collector_.GetHistory(definition.id, limit);
+
+    if (!history.has_value()) {
+        return MakeErrorResponse(http::status::service_unavailable, "metrics_not_ready",
+                                 "metrics collector has not produced a history snapshot yet");
+    }
+
+    std::ostringstream body;
+
+    body << "{\"service_id\":\"" << JsonEscape(definition.id) << "\",\"points\":[";
+
+    for (std::size_t index = 0; index < history->size(); ++index) {
+        const ServiceMetrics& metrics = (*history)[index];
+
+        if (metrics.service_id != definition.id || !metrics.IsStructurallyValid()) {
+            return MakeErrorResponse(http::status::internal_server_error, "invalid_metrics_cache",
+                                     "metrics collector returned an invalid history point");
+        }
+
+        if (index > 0) {
+            body << ',';
+        }
+
+        body << "{\"available\":" << (metrics.available ? "true" : "false") << ",\"pid\":" << metrics.pid
+             << ",\"collected_at_unix_ms\":" << metrics.collected_at_unix_ms << ",\"cpu_percent\":";
+
+        AppendOptionalDouble(body, metrics.cpu_percent);
+
+        body << ",\"rss_bytes\":";
+
+        AppendOptionalUint64(body, metrics.rss_bytes);
+
+        body << ",\"thread_count\":";
+
+        AppendOptionalUint64(body, metrics.thread_count);
+
+        body << ",\"fd_count\":";
+
+        AppendOptionalUint64(body, metrics.fd_count);
+
+        body << '}';
     }
 
     body << "]}";

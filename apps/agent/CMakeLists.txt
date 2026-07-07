@@ -13,6 +13,13 @@ add_executable(agent main.cpp
         include/agent/service_definition.h
         src/service_registry.cpp
         include/agent/service_registry.h
+        include/agent/service_metrics.h
+        src/procfs_reader.cpp
+        include/agent/procfs_reader.h
+        src/metrics_sampler.cpp
+        include/agent/metrics_sampler.h
+        src/metrics_collector.cpp
+        include/agent/metrics_collector.h
 )
 
 target_include_directories(agent PRIVATE include)

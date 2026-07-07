@@ -8,6 +8,8 @@
 #include <QSet>
 #include <QUrlQuery>
 
+#include <cmath>
+#include <limits>
 #include <utility>
 
 namespace aegis::desktop {
@@ -20,6 +22,64 @@ AgentError MakeClientError(const QString& code, const QString& message) {
     error.code = code;
     error.message = message;
     return error;
+}
+
+bool ParseRequiredInt64(const QJsonValue& value, const qint64 minimum, qint64& result) {
+    if (!value.isDouble()) {
+        return false;
+    }
+
+    const double parsed = value.toDouble();
+
+    if (!std::isfinite(parsed) || std::floor(parsed) != parsed || parsed < static_cast<double>(minimum)
+        || parsed > static_cast<double>(std::numeric_limits<qint64>::max())) {
+        return false;
+    }
+
+    result = static_cast<qint64>(parsed);
+    return true;
+}
+
+bool ParseOptionalDouble(const QJsonValue& value, const double minimum, const double maximum,
+                         std::optional<double>& result) {
+    if (value.isNull()) {
+        result.reset();
+        return true;
+    }
+
+    if (!value.isDouble()) {
+        return false;
+    }
+
+    const double parsed = value.toDouble();
+
+    if (!std::isfinite(parsed) || parsed < minimum || parsed > maximum) {
+        return false;
+    }
+
+    result = parsed;
+    return true;
+}
+
+bool ParseOptionalUInt64(const QJsonValue& value, std::optional<quint64>& result) {
+    if (value.isNull()) {
+        result.reset();
+        return true;
+    }
+
+    if (!value.isDouble()) {
+        return false;
+    }
+
+    const double parsed = value.toDouble();
+
+    if (!std::isfinite(parsed) || std::floor(parsed) != parsed || parsed < 0.0
+        || parsed > static_cast<double>(std::numeric_limits<quint64>::max())) {
+        return false;
+    }
+
+    result = static_cast<quint64>(parsed);
+    return true;
 }
 
 } // namespace
@@ -126,6 +186,93 @@ void AgentClient::GetLogs(const QString& service_id, const int tail, LogsCallbac
             }
 
             callback(lines, {});
+        });
+}
+
+void AgentClient::GetMetrics(const QString& service_id, MetricsCallback callback) {
+    SendJsonRequest(
+        HttpMethod::kGet, BuildServiceUrl(service_id, "metrics"),
+        [service_id, callback = std::move(callback)](std::optional<QJsonObject> object, AgentError error) mutable {
+            if (!object.has_value()) {
+                callback(std::nullopt, std::move(error));
+                return;
+            }
+
+            const std::optional<ServiceMetricsSnapshot> metrics = ParseServiceMetricsSnapshot(*object);
+
+            if (!metrics.has_value()) {
+                callback(std::nullopt,
+                         MakeClientError("invalid_response", "Agent metrics response has an invalid structure"));
+                return;
+            }
+
+            if (metrics->service_id != service_id) {
+                callback(std::nullopt, MakeClientError("invalid_response",
+                                                       "Agent metrics response service_id does not match the request"));
+                return;
+            }
+
+            callback(metrics, {});
+        });
+}
+
+void AgentClient::GetMetricsHistory(const QString& service_id, const int limit, MetricsHistoryCallback callback) {
+    QUrl url = BuildServiceUrl(service_id, "metrics/history");
+
+    QUrlQuery query;
+
+    query.addQueryItem("limit", QString::number(limit));
+
+    url.setQuery(query);
+
+    SendJsonRequest(
+        HttpMethod::kGet, url,
+        [service_id, callback = std::move(callback)](std::optional<QJsonObject> object, AgentError error) mutable {
+            if (!object.has_value()) {
+                callback(std::nullopt, std::move(error));
+                return;
+            }
+
+            const QJsonValue response_service_id = object->value("service_id");
+
+            const QJsonValue points_value = object->value("points");
+
+            if (!response_service_id.isString() || response_service_id.toString() != service_id
+                || !points_value.isArray()) {
+                callback(std::nullopt, MakeClientError("invalid_response",
+                                                       "Agent metrics history response has an invalid structure"));
+
+                return;
+            }
+
+            QList<ServiceMetricsSnapshot> points;
+
+            qint64 previous_timestamp = -1;
+
+            for (const QJsonValue& value : points_value.toArray()) {
+                if (!value.isObject()) {
+                    callback(std::nullopt,
+                             MakeClientError("invalid_response", "Agent metrics history contains a non-object point"));
+
+                    return;
+                }
+
+                const std::optional<ServiceMetricsSnapshot> point =
+                    ParseServiceMetricsValues(value.toObject(), service_id);
+
+                if (!point.has_value() || point->collected_at_unix_ms < previous_timestamp) {
+                    callback(std::nullopt,
+                             MakeClientError("invalid_response", "Agent metrics history contains an invalid point"));
+
+                    return;
+                }
+
+                previous_timestamp = point->collected_at_unix_ms;
+
+                points.push_back(*point);
+            }
+
+            callback(points, {});
         });
 }
 
@@ -263,6 +410,16 @@ std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObje
     return snapshot;
 }
 
+std::optional<ServiceMetricsSnapshot> AgentClient::ParseServiceMetricsSnapshot(const QJsonObject& object) {
+    const QJsonValue service_id_value = object.value("service_id");
+
+    if (!service_id_value.isString() || service_id_value.toString().isEmpty()) {
+        return std::nullopt;
+    }
+
+    return ParseServiceMetricsValues(object, service_id_value.toString());
+}
+
 AgentError AgentClient::ParseError(const int http_status, const QJsonObject& object, const QString& fallback_message) {
     AgentError error;
 
@@ -279,6 +436,45 @@ AgentError AgentClient::ParseError(const int http_status, const QJsonObject& obj
     }
 
     return error;
+}
+
+std::optional<ServiceMetricsSnapshot> AgentClient::ParseServiceMetricsValues(const QJsonObject& object,
+                                                                             const QString& service_id) {
+    const QJsonValue available_value = object.value("available");
+
+    if (service_id.isEmpty() || !available_value.isBool()) {
+        return std::nullopt;
+    }
+
+    ServiceMetricsSnapshot snapshot;
+
+    snapshot.service_id = service_id;
+    snapshot.available = available_value.toBool();
+
+    if (!ParseRequiredInt64(object.value("pid"), -1, snapshot.pid)
+        || !ParseRequiredInt64(object.value("collected_at_unix_ms"), 0, snapshot.collected_at_unix_ms)
+        || !ParseOptionalDouble(object.value("cpu_percent"), 0.0, 100.0, snapshot.cpu_percent)
+        || !ParseOptionalUInt64(object.value("rss_bytes"), snapshot.rss_bytes)
+        || !ParseOptionalUInt64(object.value("thread_count"), snapshot.thread_count)
+        || !ParseOptionalUInt64(object.value("fd_count"), snapshot.fd_count)) {
+        return std::nullopt;
+    }
+
+    if (!snapshot.available) {
+        if (snapshot.cpu_percent.has_value() || snapshot.rss_bytes.has_value() || snapshot.thread_count.has_value()
+            || snapshot.fd_count.has_value()) {
+            return std::nullopt;
+        }
+
+        return snapshot;
+    }
+
+    if (snapshot.pid <= 0 || !snapshot.rss_bytes.has_value() || !snapshot.thread_count.has_value()
+        || !snapshot.fd_count.has_value()) {
+        return std::nullopt;
+    }
+
+    return snapshot;
 }
 
 } // namespace aegis::desktop

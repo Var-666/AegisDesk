@@ -1,8 +1,10 @@
 #include "agent/agent_api.h"
 #include "agent/http_server.h"
+#include "agent/metrics_collector.h"
 #include "agent/service_registry.h"
 
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <iostream>
@@ -168,7 +170,24 @@ int main(int argc, char* argv[]) {
         std::cerr << "[agent] " << registry_error << '\n';
     }
 
-    aegis::agent::AgentApi api(registry);
+    aegis::agent::MetricsCollector metrics_collector(registry, {
+                                                                   .interval = std::chrono::milliseconds(1000),
+                                                               });
+
+    std::string collector_error;
+
+    if (!metrics_collector.Start(collector_error)) {
+        std::cerr << "[agent] failed to start metrics collector: " << collector_error << '\n';
+
+        std::string shutdown_error;
+        registry.StopAll(shutdown_error);
+
+        return 1;
+    }
+
+    aegis::agent::AgentApi api(registry, metrics_collector);
+
+    int exit_code = 0;
 
     try {
         aegis::agent::HttpServer server(
@@ -179,25 +198,25 @@ int main(int argc, char* argv[]) {
             [&api](const aegis::agent::HttpRequest& request) { return api.Handle(request); });
 
         std::cout << "AegisDesk Agent listening on http://127.0.0.1:" << options->port << '\n';
-
         std::cout << "service config: " << *config_path << '\n';
-
         std::cout << "path base directory: " << *work_dir << '\n';
 
         server.Run([] { return g_stop_requested != 0; });
     } catch (const std::exception& exception) {
         std::cerr << "[agent] fatal error: " << exception.what() << '\n';
-
-        return 1;
+        exit_code = 1;
     }
+
+    // 先停止指标采集，避免它继续访问即将退出的服务进程。
+    metrics_collector.Stop();
 
     std::string shutdown_error;
 
     if (!registry.StopAll(shutdown_error)) {
         std::cerr << "[agent] shutdown stop failed: " << shutdown_error << '\n';
 
-        return 1;
+        exit_code = 1;
     }
 
-    return 0;
+    return exit_code;
 }
