@@ -1,37 +1,41 @@
-#include "agent/procfs_reader.h"
+#include "agent/platform_metrics_reader.h"
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
 
 namespace aegis::agent {
 namespace {
+
 constexpr std::uint64_t kBytesPerKilobyte = 1024;
 
-constexpr std::uint64_t kProcStatUtimeIndex = 11;
-constexpr std::uint64_t kProcStatStimeIndex = 12;
-constexpr std::uint64_t kProcStatStartTimeIndex = 19;
+constexpr std::size_t kProcStatUtimeIndex = 11;
+constexpr std::size_t kProcStatStimeIndex = 12;
+constexpr std::size_t kProcStatStartTimeIndex = 19;
 
 constexpr std::size_t kMinimumProcStatFieldCount = kProcStatStartTimeIndex + 1;
 
-// 构造 /proc 路径
 [[nodiscard]] std::filesystem::path MakeProcPath(const pid_t pid, const std::string_view file_name) {
     return std::filesystem::path("/proc") / std::to_string(pid) / std::string(file_name);
 }
 
-// 删除字符串首尾空白字符
 [[nodiscard]] std::string_view Trim(std::string_view value) noexcept {
     while (!value.empty()
            && (value.front() == ' ' || value.front() == '\t' || value.front() == '\r' || value.front() == '\n')) {
         value.remove_prefix(1);
     }
+
     while (!value.empty()
            && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r' || value.back() == '\n')) {
         value.remove_suffix(1);
@@ -40,15 +44,14 @@ constexpr std::size_t kMinimumProcStatFieldCount = kProcStatStartTimeIndex + 1;
     return value;
 }
 
-// 按空格或 Tab 分割字符串
 [[nodiscard]] std::vector<std::string_view> SplitWhitespace(const std::string_view value) {
     std::vector<std::string_view> tokens;
 
     std::size_t position = 0;
 
     while (position < value.size()) {
-        while (position < value.size() && (value.at(position) == ' ' || value.at(position) == '\t')) {
-            position++;
+        while (position < value.size() && (value[position] == ' ' || value[position] == '\t')) {
+            ++position;
         }
 
         if (position == value.size()) {
@@ -58,17 +61,17 @@ constexpr std::size_t kMinimumProcStatFieldCount = kProcStatStartTimeIndex + 1;
         const std::size_t start = position;
 
         while (position < value.size() && value[position] != ' ' && value[position] != '\t') {
-            position++;
+            ++position;
         }
 
         tokens.push_back(value.substr(start, position - start));
     }
+
     return tokens;
 }
 
-// 把文本数字安全转换为整数
 template <typename Integer> [[nodiscard]] bool ParseUnsigned(const std::string_view value, Integer& parsed) {
-    static_assert(std::is_integral_v<Integer>);
+    static_assert(std::is_unsigned_v<Integer>);
 
     if (value.empty()) {
         return false;
@@ -79,7 +82,6 @@ template <typename Integer> [[nodiscard]] bool ParseUnsigned(const std::string_v
     return error == std::errc{} && end == value.data() + value.size();
 }
 
-// 安全地计算两个无符号整数之和
 [[nodiscard]] bool AddWithoutOverflow(const std::uint64_t left, const std::uint64_t right,
                                       std::uint64_t& result) noexcept {
     if (left > std::numeric_limits<std::uint64_t>::max() - right) {
@@ -90,12 +92,91 @@ template <typename Integer> [[nodiscard]] bool ParseUnsigned(const std::string_v
     return true;
 }
 
+[[nodiscard]] bool ConvertTicksToNanoseconds(const std::uint64_t ticks, const long ticks_per_second,
+                                             std::uint64_t& nanoseconds) {
+    constexpr std::uint64_t kNanosecondsPerSecond = 1000ULL * 1000ULL * 1000ULL;
+
+    if (ticks_per_second <= 0) {
+        return false;
+    }
+
+    const std::uint64_t ticks_per_second_u64 = static_cast<std::uint64_t>(ticks_per_second);
+
+    const std::uint64_t whole_seconds = ticks / ticks_per_second_u64;
+
+    const std::uint64_t remaining_ticks = ticks % ticks_per_second_u64;
+
+    if (whole_seconds > std::numeric_limits<std::uint64_t>::max() / kNanosecondsPerSecond) {
+        return false;
+    }
+
+    const std::uint64_t whole_nanoseconds = whole_seconds * kNanosecondsPerSecond;
+
+    const long double fractional_nanoseconds = static_cast<long double>(remaining_ticks)
+                                               * static_cast<long double>(kNanosecondsPerSecond)
+                                               / static_cast<long double>(ticks_per_second_u64);
+
+    if (!std::isfinite(fractional_nanoseconds) || fractional_nanoseconds < 0.0L
+        || fractional_nanoseconds
+               > static_cast<long double>(std::numeric_limits<std::uint64_t>::max() - whole_nanoseconds)) {
+        return false;
+    }
+
+    nanoseconds = whole_nanoseconds + static_cast<std::uint64_t>(fractional_nanoseconds);
+
+    return true;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> ReadMonotonicTimeNanoseconds(std::string& error) {
+    constexpr std::uint64_t kNanosecondsPerSecond = 1000ULL * 1000ULL * 1000ULL;
+
+    timespec time_value{};
+
+    if (::clock_gettime(CLOCK_MONOTONIC, &time_value) != 0) {
+        error = "failed to read CLOCK_MONOTONIC";
+        return std::nullopt;
+    }
+
+    if (time_value.tv_sec < 0 || time_value.tv_nsec < 0) {
+        error = "CLOCK_MONOTONIC returned a negative value";
+        return std::nullopt;
+    }
+
+    const std::uint64_t seconds = static_cast<std::uint64_t>(time_value.tv_sec);
+
+    const std::uint64_t nanoseconds = static_cast<std::uint64_t>(time_value.tv_nsec);
+
+    if (seconds > std::numeric_limits<std::uint64_t>::max() / kNanosecondsPerSecond) {
+        error = "CLOCK_MONOTONIC nanosecond conversion overflow";
+        return std::nullopt;
+    }
+
+    const std::uint64_t whole_nanoseconds = seconds * kNanosecondsPerSecond;
+
+    if (nanoseconds > std::numeric_limits<std::uint64_t>::max() - whole_nanoseconds) {
+        error = "CLOCK_MONOTONIC nanosecond conversion overflow";
+        return std::nullopt;
+    }
+
+    return whole_nanoseconds + nanoseconds;
+}
+
+[[nodiscard]] std::optional<std::uint32_t> ReadLogicalCpuCount(std::string& error) {
+    const long logical_cpu_count = ::sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (logical_cpu_count <= 0 || logical_cpu_count > static_cast<long>(std::numeric_limits<std::uint32_t>::max())) {
+        error = "failed to read online logical CPU count";
+        return std::nullopt;
+    }
+
+    return static_cast<std::uint32_t>(logical_cpu_count);
+}
+
 struct ProcStatCpuFields {
     std::uint64_t process_cpu_ticks{0};
     std::uint64_t start_time_ticks{0};
 };
 
-// 读取 /proc/<pid>/stat
 [[nodiscard]] std::optional<ProcStatCpuFields> ReadProcStatCpuFields(const pid_t pid, std::string& error) {
     const std::filesystem::path stat_path = MakeProcPath(pid, "stat");
 
@@ -117,10 +198,12 @@ struct ProcStatCpuFields {
 
     if (right_parenthesis == std::string::npos || right_parenthesis + 1 >= line.size()) {
         error = "invalid format in " + stat_path.string() + ": missing process name terminator";
+
         return std::nullopt;
     }
 
     const std::string_view fields_text = Trim(std::string_view(line).substr(right_parenthesis + 1));
+
     const std::vector<std::string_view> fields = SplitWhitespace(fields_text);
 
     if (fields.size() < kMinimumProcStatFieldCount) {
@@ -156,7 +239,6 @@ struct ProcStatusFields {
     std::uint64_t thread_count{0};
 };
 
-// 读取 /proc/<pid>/status
 [[nodiscard]] std::optional<ProcStatusFields> ReadProcStatusFields(const pid_t pid, std::string& error) {
     const std::filesystem::path status_path = MakeProcPath(pid, "status");
 
@@ -184,6 +266,7 @@ struct ProcStatusFields {
 
             if (tokens.empty() || !ParseUnsigned(tokens[0], rss_kilobytes)) {
                 error = "invalid VmRSS field in " + status_path.string();
+
                 return std::nullopt;
             }
 
@@ -197,6 +280,7 @@ struct ProcStatusFields {
 
             if (tokens.empty() || !ParseUnsigned(tokens[0], thread_count)) {
                 error = "invalid Threads field in " + status_path.string();
+
                 return std::nullopt;
             }
 
@@ -206,11 +290,13 @@ struct ProcStatusFields {
 
     if (!found_rss || !found_threads) {
         error = "missing VmRSS or Threads field in " + status_path.string();
+
         return std::nullopt;
     }
 
     if (rss_kilobytes > std::numeric_limits<std::uint64_t>::max() / kBytesPerKilobyte) {
         error = "VmRSS byte conversion overflow in " + status_path.string();
+
         return std::nullopt;
     }
 
@@ -220,7 +306,6 @@ struct ProcStatusFields {
     };
 }
 
-// 统计打开文件描述符数量
 [[nodiscard]] std::optional<std::uint64_t> CountOpenFileDescriptors(const pid_t pid, std::string& error) {
     const std::filesystem::path fd_path = MakeProcPath(pid, "fd");
 
@@ -230,6 +315,7 @@ struct ProcStatusFields {
 
     if (directory_error) {
         error = "failed to open " + fd_path.string() + ": " + directory_error.message();
+
         return std::nullopt;
     }
 
@@ -255,104 +341,80 @@ struct ProcStatusFields {
 
     return count;
 }
-} // namespace
 
-std::optional<ProcessRawStats> ReadProcessRawStats(const pid_t pid, std::string& error) {
-    error.clear();
+class LinuxProcfsMetricsReader final : public PlatformMetricsReader {
+public:
+    std::optional<ProcessRawStats> ReadProcessRawStats(const pid_t pid, std::string& error) override {
+        error.clear();
 
-    if (pid <= 0) {
-        error = "pid must be greater than zero";
-        return std::nullopt;
-    }
-
-    const std::optional<ProcStatCpuFields> stat_fields = ReadProcStatCpuFields(pid, error);
-
-    if (!stat_fields.has_value()) {
-        return std::nullopt;
-    }
-
-    const std::optional<ProcStatusFields> status_fields = ReadProcStatusFields(pid, error);
-
-    if (!status_fields.has_value()) {
-        return std::nullopt;
-    }
-
-    const std::optional<std::uint64_t> fd_count = CountOpenFileDescriptors(pid, error);
-
-    if (!fd_count.has_value()) {
-        return std::nullopt;
-    }
-
-    return ProcessRawStats{
-        .process_cpu_ticks = stat_fields->process_cpu_ticks,
-        .start_time_ticks = stat_fields->start_time_ticks,
-        .rss_bytes = status_fields->rss_bytes,
-        .thread_count = status_fields->thread_count,
-        .fd_count = *fd_count,
-    };
-}
-
-std::optional<SystemCpuStats> ReadSystemCpuStats(std::string& error) {
-    error.clear();
-
-    constexpr std::string_view kProcStatPath{"/proc/stat"};
-
-    std::ifstream input{std::string(kProcStatPath)};
-
-    if (!input.is_open()) {
-        error = "failed to open " + std::string(kProcStatPath);
-        return std::nullopt;
-    }
-
-    std::string line;
-
-    while (std::getline(input, line)) {
-        const std::string_view view = line;
-
-        if (!view.starts_with("cpu ")) {
-            continue;
-        }
-
-        const std::vector<std::string_view> fields = SplitWhitespace(view.substr(std::string_view("cpu").size()));
-
-        // 至少应有 user、nice、system、idle 四项。
-        if (fields.size() < 4) {
-            error = "invalid format in /proc/stat: "
-                    "too few CPU fields";
+        if (pid <= 0) {
+            error = "pid must be greater than zero";
             return std::nullopt;
         }
 
-        constexpr std::size_t kMaxCpuFields = 8;
+        const std::optional<ProcStatCpuFields> stat_fields = ReadProcStatCpuFields(pid, error);
 
-        const std::size_t field_count = std::min(fields.size(), kMaxCpuFields);
-
-        std::uint64_t total_cpu_ticks = 0;
-
-        for (std::size_t index = 0; index < field_count; ++index) {
-            std::uint64_t value = 0;
-
-            if (!ParseUnsigned(fields[index], value)) {
-                error = "invalid numeric CPU field in /proc/stat";
-                return std::nullopt;
-            }
-
-            std::uint64_t next_total = 0;
-
-            if (!AddWithoutOverflow(total_cpu_ticks, value, next_total)) {
-                error = "system CPU tick overflow in /proc/stat";
-                return std::nullopt;
-            }
-
-            total_cpu_ticks = next_total;
+        if (!stat_fields.has_value()) {
+            return std::nullopt;
         }
 
-        return SystemCpuStats{
-            .total_cpu_ticks = total_cpu_ticks,
+        const std::optional<ProcStatusFields> status_fields = ReadProcStatusFields(pid, error);
+
+        if (!status_fields.has_value()) {
+            return std::nullopt;
+        }
+
+        const std::optional<std::uint64_t> fd_count = CountOpenFileDescriptors(pid, error);
+
+        if (!fd_count.has_value()) {
+            return std::nullopt;
+        }
+
+        const long ticks_per_second = ::sysconf(_SC_CLK_TCK);
+
+        std::uint64_t process_cpu_time_ns = 0;
+
+        if (!ConvertTicksToNanoseconds(stat_fields->process_cpu_ticks, ticks_per_second, process_cpu_time_ns)) {
+            error = "failed to convert Linux CPU ticks to nanoseconds";
+
+            return std::nullopt;
+        }
+
+        return ProcessRawStats{
+            .process_cpu_time_ns = process_cpu_time_ns,
+            .process_identity = stat_fields->start_time_ticks,
+            .rss_bytes = status_fields->rss_bytes,
+            .thread_count = status_fields->thread_count,
+            .fd_count = *fd_count,
         };
     }
 
-    error = "cpu summary line not found in /proc/stat";
-    return std::nullopt;
+    std::optional<SystemCapacitySnapshot> ReadSystemCapacity(std::string& error) override {
+        error.clear();
+
+        const std::optional<std::uint64_t> monotonic_time_ns = ReadMonotonicTimeNanoseconds(error);
+
+        if (!monotonic_time_ns.has_value()) {
+            return std::nullopt;
+        }
+
+        const std::optional<std::uint32_t> logical_cpu_count = ReadLogicalCpuCount(error);
+
+        if (!logical_cpu_count.has_value()) {
+            return std::nullopt;
+        }
+
+        return SystemCapacitySnapshot{
+            .monotonic_time_ns = *monotonic_time_ns,
+            .logical_cpu_count = *logical_cpu_count,
+        };
+    }
+};
+
+} // namespace
+
+std::unique_ptr<PlatformMetricsReader> CreatePlatformMetricsReader() {
+    return std::make_unique<LinuxProcfsMetricsReader>();
 }
 
 } // namespace aegis::agent

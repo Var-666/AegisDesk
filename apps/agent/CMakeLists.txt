@@ -14,13 +14,27 @@ add_executable(agent main.cpp
         src/service_registry.cpp
         include/agent/service_registry.h
         include/agent/service_metrics.h
-        src/procfs_reader.cpp
-        include/agent/procfs_reader.h
         src/metrics_sampler.cpp
         include/agent/metrics_sampler.h
         src/metrics_collector.cpp
         include/agent/metrics_collector.h
+        include/agent/platform_metrics_reader.h
 )
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(agent PRIVATE src/linux_metrics_reader.cpp)
+elseif (APPLE)
+    target_sources(agent PRIVATE src/macos_metrics_reader.cpp)
+    find_library(AEGIS_LIBPROC_LIBRARY NAMES proc)
+
+    if (NOT AEGIS_LIBPROC_LIBRARY)
+        message(FATAL_ERROR "macOS libproc library was not found")
+    endif ()
+
+    target_link_libraries(agent PRIVATE ${AEGIS_LIBPROC_LIBRARY})
+else ()
+    target_sources(agent PRIVATE src/unsupported_metrics_reader.cpp)
+endif ()
 
 target_include_directories(agent PRIVATE include)
 target_include_directories(agent SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})

@@ -1,19 +1,26 @@
 #include "agent/metrics_collector.h"
 
-#include "agent/procfs_reader.h"
 #include "agent/service_registry.h"
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <string>
+#include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace aegis::agent {
 
 MetricsCollector::MetricsCollector(ServiceRegistry& registry, MetricsCollectorOptions options)
+    : MetricsCollector(registry, CreatePlatformMetricsReader(), options) {}
+
+MetricsCollector::MetricsCollector(ServiceRegistry& registry, std::unique_ptr<PlatformMetricsReader> metrics_reader,
+                                   MetricsCollectorOptions options)
     : registry_(registry)
-    , options_(options) {}
+    , options_(options)
+    , metrics_reader_(std::move(metrics_reader)) {}
 
 MetricsCollector::~MetricsCollector() noexcept {
     Stop();
@@ -32,6 +39,11 @@ bool MetricsCollector::Start(std::string& error) {
         return false;
     }
 
+    if (metrics_reader_ == nullptr) {
+        error = "platform metrics reader is not available";
+        return false;
+    }
+
     std::scoped_lock lock(lifecycle_mutex_);
 
     if (worker_.joinable()) {
@@ -45,6 +57,7 @@ bool MetricsCollector::Start(std::string& error) {
         worker_ = std::jthread([this](const std::stop_token stop_token) { Run(stop_token); });
     } catch (const std::system_error& exception) {
         error = std::string("failed to start metrics collector: ") + exception.what();
+
         return false;
     }
 
@@ -141,12 +154,12 @@ void MetricsCollector::CollectOnce() {
         }
     }
 
-    std::optional<SystemCpuStats> system_cpu_stats;
+    std::optional<SystemCapacitySnapshot> system_capacity;
 
     if (has_running_service) {
-        std::string system_cpu_error;
+        std::string system_capacity_error;
 
-        system_cpu_stats = ReadSystemCpuStats(system_cpu_error);
+        system_capacity = metrics_reader_->ReadSystemCapacity(system_capacity_error);
     }
 
     std::unordered_map<std::string, ServiceMetrics> next_metrics;
@@ -160,34 +173,43 @@ void MetricsCollector::CollectOnce() {
 
         if (!service_running) {
             sampler_.ForgetService(service.id);
+
             next_metrics.emplace(service.id, MakeUnavailableMetrics(service.id, -1, collected_at_unix_ms));
+
             continue;
         }
 
-        if (!system_cpu_stats.has_value()) {
+        if (!system_capacity.has_value()) {
             sampler_.ForgetService(service.id);
+
             next_metrics.emplace(service.id, MakeUnavailableMetrics(service.id, pid, collected_at_unix_ms));
+
             continue;
         }
 
         std::string process_error;
 
-        const std::optional<ProcessRawStats> process_stats = ReadProcessRawStats(service.status.pid, process_error);
+        const std::optional<ProcessRawStats> process_stats =
+            metrics_reader_->ReadProcessRawStats(service.status.pid, process_error);
 
         if (!process_stats.has_value()) {
             sampler_.ForgetService(service.id);
+
             next_metrics.emplace(service.id, MakeUnavailableMetrics(service.id, pid, collected_at_unix_ms));
+
             continue;
         }
 
         std::string sampler_error;
 
         const std::optional<ServiceMetrics> metrics = sampler_.Sample(
-            service.id, service.status.pid, *process_stats, *system_cpu_stats, collected_at_unix_ms, sampler_error);
+            service.id, service.status.pid, *process_stats, *system_capacity, collected_at_unix_ms, sampler_error);
 
         if (!metrics.has_value()) {
             sampler_.ForgetService(service.id);
+
             next_metrics.emplace(service.id, MakeUnavailableMetrics(service.id, pid, collected_at_unix_ms));
+
             continue;
         }
 
@@ -233,7 +255,9 @@ void MetricsCollector::Run(const std::stop_token stop_token) {
 
 UnixTimeMilliseconds MetricsCollector::NowUnixTimeMilliseconds() noexcept {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
+
     const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+
     return milliseconds < 0 ? 0 : static_cast<UnixTimeMilliseconds>(milliseconds);
 }
 

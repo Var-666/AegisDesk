@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agent/metrics_sampler.h"
+#include "agent/platform_metrics_reader.h"
 #include "agent/service_metrics.h"
 
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -30,6 +32,9 @@ struct MetricsCollectorOptions {
 class MetricsCollector {
 public:
     explicit MetricsCollector(ServiceRegistry& registry, MetricsCollectorOptions options = {});
+
+    MetricsCollector(ServiceRegistry& registry, std::unique_ptr<PlatformMetricsReader> metrics_reader,
+                     MetricsCollectorOptions options = {});
 
     ~MetricsCollector() noexcept;
 
@@ -65,6 +70,8 @@ private:
     std::mutex collection_mutex_;
 
     mutable std::shared_mutex metrics_mutex_;
+
+    std::unique_ptr<PlatformMetricsReader> metrics_reader_;
 
     std::unordered_map<std::string, ServiceMetrics> latest_metrics_;
 
