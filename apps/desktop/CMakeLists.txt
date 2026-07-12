@@ -1,16 +1,23 @@
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Charts)
 
-add_executable(desktop src/main.cpp
-        src/main_window.cpp
-        include/desktop/main_window.h
-        src/agent_client.cpp
-        include/desktop/agent_client.h
-        src/metric_chart_widget.cpp
-        include/desktop/metric_chart_widget.h
-        src/metrics_history_panel.cpp
-        include/desktop/metrics_history_panel.h
-)
+add_executable(desktop
+        src/main.cpp
 
+        src/api/agent_client.cpp
+        include/desktop/api/agent_client.h
+
+        src/widgets/main_window.cpp
+        src/widgets/metric_chart_widget.cpp
+        src/widgets/metrics_history_panel.cpp
+        src/widgets/service_health_panel.cpp
+        include/desktop/widgets/main_window.h
+        include/desktop/widgets/metric_chart_widget.h
+        include/desktop/widgets/metrics_history_panel.h
+        include/desktop/widgets/service_health_panel.h
+
+        src/common/ui_helpers.cpp
+        include/desktop/common/ui_helpers.h
+)
 
 target_include_directories(desktop PRIVATE include)
 

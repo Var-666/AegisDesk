@@ -1,4 +1,4 @@
-#include "desktop/main_window.h"
+#include "desktop/widgets/main_window.h"
 
 #include <QApplication>
 #include <QCommandLineOption>

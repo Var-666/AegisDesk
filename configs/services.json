@@ -13,7 +13,55 @@
         "1000"
       ],
       "log_path": "runtime/logs/demo_service.log",
-      "auto_start": false
+      "auto_start": false,
+      "health_check": {
+        "enabled": true,
+        "type": "process",
+        "interval_seconds": 5,
+        "timeout_milliseconds": 1000,
+        "failure_threshold": 3
+      },
+      "alert_rules": [
+        {
+          "id": "high_cpu",
+          "metric": "cpu_percent",
+          "operator": ">",
+          "threshold": 80,
+          "duration_seconds": 60,
+          "severity": "warning",
+          "enabled": true,
+          "description": "CPU usage is higher than 80% for 60 seconds"
+        },
+        {
+          "id": "high_rss",
+          "metric": "rss_bytes",
+          "operator": ">",
+          "threshold": 268435456,
+          "duration_seconds": 60,
+          "severity": "warning",
+          "enabled": true,
+          "description": "RSS memory is higher than 256 MiB for 60 seconds"
+        },
+        {
+          "id": "unhealthy_process",
+          "metric": "health_state",
+          "operator": "==",
+          "threshold": "unhealthy",
+          "duration_seconds": 15,
+          "severity": "critical",
+          "enabled": true,
+          "description": "Process remains unhealthy for 15 seconds"
+        }
+      ],
+      "recovery_policy": {
+        "enabled": true,
+        "restart_on_unhealthy": true,
+        "restart_on_critical_alert": false,
+        "max_restarts": 3,
+        "window_seconds": 300,
+        "backoff_seconds": 10,
+        "startup_grace_seconds": 10
+      }
     },
     {
       "id": "demo_worker",
@@ -27,7 +75,65 @@
         "1500"
       ],
       "log_path": "runtime/logs/demo_worker.log",
-      "auto_start": false
+      "auto_start": false,
+      "health_check": {
+        "enabled": true,
+        "type": "process",
+        "interval_seconds": 5,
+        "timeout_milliseconds": 1000,
+        "failure_threshold": 3
+      },
+      "alert_rules": [
+        {
+          "id": "high_cpu",
+          "metric": "cpu_percent",
+          "operator": ">",
+          "threshold": 80,
+          "duration_seconds": 60,
+          "severity": "warning",
+          "enabled": true,
+          "description": "CPU usage is higher than 80% for 60 seconds"
+        },
+        {
+          "id": "high_thread_count",
+          "metric": "thread_count",
+          "operator": ">",
+          "threshold": 50,
+          "duration_seconds": 30,
+          "severity": "warning",
+          "enabled": true,
+          "description": "Thread count is higher than 50 for 30 seconds"
+        },
+        {
+          "id": "high_fd_count",
+          "metric": "fd_count",
+          "operator": ">",
+          "threshold": 512,
+          "duration_seconds": 30,
+          "severity": "critical",
+          "enabled": true,
+          "description": "Open file descriptor count is higher than 512"
+        },
+        {
+          "id": "unhealthy_process",
+          "metric": "health_state",
+          "operator": "==",
+          "threshold": "unhealthy",
+          "duration_seconds": 15,
+          "severity": "critical",
+          "enabled": true,
+          "description": "Process remains unhealthy for 15 seconds"
+        }
+      ],
+      "recovery_policy": {
+        "enabled": true,
+        "restart_on_unhealthy": true,
+        "restart_on_critical_alert": false,
+        "max_restarts": 3,
+        "window_seconds": 300,
+        "backoff_seconds": 10,
+        "startup_grace_seconds": 10
+      }
     }
   ]
 }

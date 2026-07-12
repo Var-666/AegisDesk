@@ -1,16 +1,15 @@
-#include "agent/agent_api.h"
-#include "agent/http_server.h"
-#include "agent/metrics_collector.h"
-#include "agent/service_registry.h"
+#include "agent/api/agent_api.h"
+#include "agent/api/http_server.h"
+#include "agent/health/health_monitor.h"
+#include "agent/metrics/metrics_collector.h"
+#include "agent/service/service_registry.h"
 
 #include <charconv>
-#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string_view>
-#include <system_error>
 
 namespace {
 
@@ -131,7 +130,6 @@ int main(int argc, char* argv[]) {
     }
 
     const auto work_dir = MakeAbsolutePath(options->work_dir, "work directory");
-
     const auto config_path = MakeAbsolutePath(options->config_path, "config path");
 
     if (!work_dir.has_value() || !config_path.has_value()) {
@@ -140,7 +138,6 @@ int main(int argc, char* argv[]) {
 
     if (!std::filesystem::exists(*work_dir) || !std::filesystem::is_directory(*work_dir)) {
         std::cerr << "work directory does not exist or is not a directory: " << *work_dir << '\n';
-
         return 1;
     }
 
@@ -165,8 +162,6 @@ int main(int argc, char* argv[]) {
     }
 
     if (!registry.StartAutoStartServices(registry_error)) {
-        // 不退出 Agent：即使某个 auto_start 服务失败，
-        // 控制面仍应保持可用，方便后续诊断。
         std::cerr << "[agent] " << registry_error << '\n';
     }
 
@@ -185,7 +180,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    aegis::agent::AgentApi api(registry, metrics_collector);
+    aegis::agent::HealthMonitor health_monitor(registry, metrics_collector,
+                                               {
+                                                   .interval = std::chrono::milliseconds(2000),
+                                                   .alert_manager_options =
+                                                       {
+                                                           .recent_resolved_capacity = 200,
+                                                       },
+                                                   .recovery_manager_options =
+                                                       {
+                                                           .recent_event_capacity = 200,
+                                                           .suppress_event_cooldown_seconds = 30,
+                                                       },
+                                               });
+
+    std::string health_monitor_error;
+
+    if (!health_monitor.Start(health_monitor_error)) {
+        std::cerr << "[agent] failed to start health monitor: " << health_monitor_error << '\n';
+
+        metrics_collector.Stop();
+
+        std::string shutdown_error;
+        registry.StopAll(shutdown_error);
+
+        return 1;
+    }
+
+    aegis::agent::AgentApi api(registry, metrics_collector, health_monitor);
 
     int exit_code = 0;
 
@@ -207,11 +229,10 @@ int main(int argc, char* argv[]) {
         exit_code = 1;
     }
 
-    // 先停止指标采集，避免它继续访问即将退出的服务进程。
+    health_monitor.Stop();
     metrics_collector.Stop();
 
     std::string shutdown_error;
-
     if (!registry.StopAll(shutdown_error)) {
         std::cerr << "[agent] shutdown stop failed: " << shutdown_error << '\n';
 
