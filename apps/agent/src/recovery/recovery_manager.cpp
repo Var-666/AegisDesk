@@ -48,6 +48,12 @@ RecoveryManagerUpdate RecoveryManager::EvaluateAndRecover(ProcessSupervisor& sup
         return update;
     }
 
+    const ServiceStatus current_status = supervisor.GetStatus();
+
+    if (IsDesiredStopped(current_status.desired_state)) {
+        return update;
+    }
+
     if (health_status.state == HealthState::kUnhealthy && !state.has_seen_healthy && !definition.auto_start) {
         if (ShouldEmitSuppressedEventLocked(state, now_unix_ms)) {
             RecoveryEvent event{
@@ -146,8 +152,6 @@ RecoveryManagerUpdate RecoveryManager::EvaluateAndRecover(ProcessSupervisor& sup
     }
 
     std::string operation_error;
-
-    const ServiceStatus current_status = supervisor.GetStatus();
 
     bool succeeded = false;
 
@@ -319,7 +323,7 @@ void RecoveryManager::RecordRestartAttemptLocked(ServiceRecoveryState& state, co
 }
 
 bool RecoveryManager::ShouldEmitSuppressedEventLocked(ServiceRecoveryState& state,
-                                                      const UnixTimeMilliseconds now_unix_ms) {
+                                                      const UnixTimeMilliseconds now_unix_ms) const {
     const UnixTimeMilliseconds cooldown_ms = SecondsToMilliseconds(options_.suppress_event_cooldown_seconds);
 
     if (!state.last_suppressed_event_at_unix_ms.has_value()

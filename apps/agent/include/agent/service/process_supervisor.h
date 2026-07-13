@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agent/service/desired_state.h"
 #include "agent/service/service_definition.h"
 
 #include <chrono>
@@ -20,6 +21,7 @@ enum class ServiceState {
 
 struct ServiceStatus {
     ServiceState state{ServiceState::kStopped};
+    DesiredState desired_state{DesiredState::kStopped};
     pid_t pid{-1};
     std::optional<int> exit_code;
     std::chrono::seconds uptime{0};
@@ -27,7 +29,7 @@ struct ServiceStatus {
 
 class ProcessSupervisor {
 public:
-    ProcessSupervisor(ServiceDefinition definition);
+    explicit ProcessSupervisor(ServiceDefinition definition);
 
     ~ProcessSupervisor() noexcept;
 
@@ -42,13 +44,19 @@ public:
 
     [[nodiscard]] const ServiceDefinition& Definition() const noexcept;
 
+    [[nodiscard]] DesiredState GetDesiredState() const;
+
+    void SetDesiredState(DesiredState desired_state);
+
 private:
     bool ReapExitedChildLocked();
     void SaveExitStatusLocked(int status);
 
+private:
     ServiceDefinition definition_;
+    DesiredState desired_state_{DesiredState::kStopped};
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 
     pid_t pid_{-1};
     std::optional<int> last_exit_code_;

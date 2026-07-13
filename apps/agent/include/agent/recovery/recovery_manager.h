@@ -77,7 +77,8 @@ private:
     void RecordRestartAttemptLocked(ServiceRecoveryState& state, const RecoveryPolicy& policy,
                                     UnixTimeMilliseconds now_unix_ms);
 
-    [[nodiscard]] bool ShouldEmitSuppressedEventLocked(ServiceRecoveryState& state, UnixTimeMilliseconds now_unix_ms);
+    [[nodiscard]] bool ShouldEmitSuppressedEventLocked(ServiceRecoveryState& state,
+                                                       UnixTimeMilliseconds now_unix_ms) const;
 
     void PushRecentEventLocked(RecoveryEvent event);
 

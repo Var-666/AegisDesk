@@ -6,11 +6,11 @@
 #include "agent/alerts/alert_event.h"
 #include "agent/health/health_monitor.h"
 #include "agent/health/health_status.h"
-#include "agent/service/log_reader.h"
 #include "agent/metrics/metrics_collector.h"
-#include "agent/service/process_supervisor.h"
-#include "agent/recovery/recovery_policy.h"
 #include "agent/metrics/service_metrics.h"
+#include "agent/recovery/recovery_policy.h"
+#include "agent/service/log_reader.h"
+#include "agent/service/process_supervisor.h"
 #include "agent/service/service_registry.h"
 
 #include <algorithm>
@@ -103,7 +103,6 @@ struct ServiceRoute {
 
         if (equals_position != std::string_view::npos) {
             const std::string_view key = pair.substr(0, equals_position);
-
             const std::string_view value = pair.substr(equals_position + 1);
 
             if (key == expected_key) {
@@ -138,8 +137,8 @@ struct ServiceRoute {
 }
 
 void AppendStatusFields(std::ostringstream& body, const ServiceStatus& status) {
-    body << R"("state":")" << ToString(status.state) << R"(","pid":)" << status.pid
-         << ",\"uptime_seconds\":" << status.uptime.count() << ",\"last_exit_code\":";
+    body << R"("state":")" << ToString(status.state) << R"(","desired_state":")" << ToString(status.desired_state)
+         << R"(","pid":)" << status.pid << ",\"uptime_seconds\":" << status.uptime.count() << ",\"last_exit_code\":";
 
     if (status.exit_code.has_value()) {
         body << *status.exit_code;
@@ -176,17 +175,16 @@ void AppendOptionalString(std::ostringstream& body, const std::optional<std::str
 }
 
 void AppendHealthStatusJson(std::ostringstream& body, const HealthStatus& status) {
-    body << "{\"service_id\":\"" << JsonEscape(status.service_id) << "\",\"state\":\"" << ToString(status.state)
-         << "\",\"reason\":\"" << JsonEscape(status.reason)
-         << "\",\"consecutive_failures\":" << status.consecutive_failures
-         << ",\"checked_at_unix_ms\":" << status.checked_at_unix_ms << '}';
+    body << R"({"service_id":")" << JsonEscape(status.service_id) << R"(","state":")" << ToString(status.state)
+         << R"(","reason":")" << JsonEscape(status.reason) << R"(","consecutive_failures":)"
+         << status.consecutive_failures << ",\"checked_at_unix_ms\":" << status.checked_at_unix_ms << '}';
 }
 
 void AppendAlertEventJson(std::ostringstream& body, const AlertEvent& event) {
-    body << "{\"id\":\"" << JsonEscape(event.id) << "\",\"service_id\":\"" << JsonEscape(event.service_id)
-         << "\",\"rule_id\":\"" << JsonEscape(event.rule_id) << "\",\"severity\":\"" << ToString(event.severity)
-         << "\",\"state\":\"" << ToString(event.state) << "\",\"message\":\"" << JsonEscape(event.message)
-         << "\",\"first_triggered_at_unix_ms\":" << event.first_triggered_at_unix_ms
+    body << R"({"id":")" << JsonEscape(event.id) << R"(","service_id":")" << JsonEscape(event.service_id)
+         << R"(","rule_id":")" << JsonEscape(event.rule_id) << R"(","severity":")" << ToString(event.severity)
+         << R"(","state":")" << ToString(event.state) << R"(","message":")" << JsonEscape(event.message)
+         << R"(","first_triggered_at_unix_ms":)" << event.first_triggered_at_unix_ms
          << ",\"last_triggered_at_unix_ms\":" << event.last_triggered_at_unix_ms << ",\"resolved_at_unix_ms\":";
 
     if (event.resolved_at_unix_ms.has_value()) {
@@ -422,7 +420,7 @@ HttpResponse AgentApi::Handle(const HttpRequest& request) {
 
     return MakeErrorResponse(http::status::not_found, "not_found", "service action not found");
 }
-HttpResponse AgentApi::MakeServiceListResponse() {
+HttpResponse AgentApi::MakeServiceListResponse() const {
     const std::vector<ServiceSummary> services = registry_.ListServices();
 
     std::ostringstream body;
@@ -434,12 +432,12 @@ HttpResponse AgentApi::MakeServiceListResponse() {
             body << ',';
         }
 
-        const ServiceSummary& service = services[index];
+        const auto& [id, display_name, auto_start, status] = services[index];
 
-        body << R"({"id":")" << JsonEscape(service.id) << R"(","display_name":")" << JsonEscape(service.display_name)
-             << R"(","auto_start":)" << (service.auto_start ? "true" : "false") << ',';
+        body << R"({"id":")" << JsonEscape(id) << R"(","display_name":")" << JsonEscape(display_name)
+             << R"(","auto_start":)" << (auto_start ? "true" : "false") << ',';
 
-        AppendStatusFields(body, service.status);
+        AppendStatusFields(body, status);
 
         body << '}';
     }
@@ -454,7 +452,7 @@ HttpResponse AgentApi::MakeStatusResponse(ProcessSupervisor& supervisor) {
 
     std::ostringstream body;
 
-    body << R"({"id":")" << JsonEscape(definition.id) << "\",\"name\":\"" << JsonEscape(definition.id)
+    body << R"({"id":")" << JsonEscape(definition.id) << R"(","name":")" << JsonEscape(definition.id)
          << R"(","display_name":")" << JsonEscape(definition.display_name) << R"(","auto_start":)"
          << (definition.auto_start ? "true" : "false") << ',';
 
@@ -484,7 +482,7 @@ HttpResponse AgentApi::MakeActionResponse(ProcessSupervisor& supervisor, const s
 
     return MakeStatusResponse(supervisor);
 }
-HttpResponse AgentApi::MakeLogsResponse(ProcessSupervisor& supervisor, const std::size_t tail) {
+HttpResponse AgentApi::MakeLogsResponse(const ProcessSupervisor& supervisor, const std::size_t tail) {
     const ServiceDefinition& definition = supervisor.Definition();
 
     std::string error;
@@ -511,7 +509,7 @@ HttpResponse AgentApi::MakeLogsResponse(ProcessSupervisor& supervisor, const std
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeMetricsResponse(ProcessSupervisor& supervisor) {
+HttpResponse AgentApi::MakeMetricsResponse(const ProcessSupervisor& supervisor) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     const std::optional<ServiceMetrics> metrics = metrics_collector_.GetLatest(definition.id);
@@ -552,7 +550,7 @@ HttpResponse AgentApi::MakeMetricsResponse(ProcessSupervisor& supervisor) {
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeMetricsHistoryResponse(ProcessSupervisor& supervisor, const std::size_t limit) {
+HttpResponse AgentApi::MakeMetricsHistoryResponse(const ProcessSupervisor& supervisor, const std::size_t limit) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     const std::optional<std::vector<ServiceMetrics>> history = metrics_collector_.GetHistory(definition.id, limit);
@@ -602,7 +600,7 @@ HttpResponse AgentApi::MakeMetricsHistoryResponse(ProcessSupervisor& supervisor,
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeHealthResponse(ProcessSupervisor& supervisor) {
+HttpResponse AgentApi::MakeHealthResponse(const ProcessSupervisor& supervisor) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     const std::optional<HealthStatus> health = health_monitor_.GetLatestHealth(definition.id);
@@ -623,7 +621,8 @@ HttpResponse AgentApi::MakeHealthResponse(ProcessSupervisor& supervisor) {
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeServiceAlertsResponse(ProcessSupervisor& supervisor, const bool include_resolved) {
+HttpResponse AgentApi::MakeServiceAlertsResponse(const ProcessSupervisor& supervisor,
+                                                 const bool include_resolved) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     const std::vector<AlertEvent> alerts = health_monitor_.GetAlertsForService(definition.id, include_resolved);
@@ -639,7 +638,7 @@ HttpResponse AgentApi::MakeServiceAlertsResponse(ProcessSupervisor& supervisor, 
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeAllAlertsResponse(const bool include_resolved, const std::size_t resolved_limit) {
+HttpResponse AgentApi::MakeAllAlertsResponse(const bool include_resolved, const std::size_t resolved_limit) const {
     std::vector<AlertEvent> alerts = health_monitor_.GetActiveAlerts();
 
     if (include_resolved) {
@@ -658,7 +657,7 @@ HttpResponse AgentApi::MakeAllAlertsResponse(const bool include_resolved, const 
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeActiveAlertsResponse() {
+HttpResponse AgentApi::MakeActiveAlertsResponse() const {
     const std::vector<AlertEvent> alerts = health_monitor_.GetActiveAlerts();
 
     std::ostringstream body;
@@ -672,7 +671,7 @@ HttpResponse AgentApi::MakeActiveAlertsResponse() {
     return MakeJsonResponse(http::status::ok, body.str());
 }
 
-HttpResponse AgentApi::MakeAcknowledgeAlertResponse(const std::string_view alert_id) {
+HttpResponse AgentApi::MakeAcknowledgeAlertResponse(const std::string_view alert_id) const {
     if (!IsValidAlertEventId(alert_id)) {
         return MakeErrorResponse(http::status::bad_request, "invalid_alert_id", "alert_id has an invalid format");
     }
@@ -700,7 +699,8 @@ HttpResponse AgentApi::MakeAcknowledgeAlertResponse(const std::string_view alert
     return MakeJsonResponse(http::status::ok, body.str());
 }
 
-HttpResponse AgentApi::MakeServiceRecoveryEventsResponse(ProcessSupervisor& supervisor, const std::size_t limit) {
+HttpResponse AgentApi::MakeServiceRecoveryEventsResponse(const ProcessSupervisor& supervisor,
+                                                         const std::size_t limit) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     const std::vector<RecoveryEvent> events = health_monitor_.GetRecoveryEventsForService(definition.id, limit);
@@ -715,7 +715,7 @@ HttpResponse AgentApi::MakeServiceRecoveryEventsResponse(ProcessSupervisor& supe
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeAllRecoveryEventsResponse(const std::size_t limit) {
+HttpResponse AgentApi::MakeAllRecoveryEventsResponse(const std::size_t limit) const {
     const std::vector<RecoveryEvent> events = health_monitor_.GetRecentRecoveryEvents(limit);
 
     std::ostringstream body;

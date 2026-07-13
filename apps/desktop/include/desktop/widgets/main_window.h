@@ -51,15 +51,15 @@ private:
 
     void ApplySnapshot(const ServiceSnapshot& snapshot);
 
-    void ApplyMetrics(const ServiceMetricsSnapshot& metrics);
+    void ApplyMetrics(const ServiceMetricsSnapshot& metrics) const;
 
     void ClearCurrentServiceDetails();
     void ClearMetrics();
     void ShowMetricsNotReady();
 
-    void UpdateActionButtons();
+    void UpdateActionButtons() const;
 
-    void ShowBackgroundError(const AgentError& error);
+    void ShowBackgroundError(const AgentError& error) const;
 
     [[nodiscard]] static QString FormatUptime(qint64 total_seconds);
 
@@ -78,6 +78,7 @@ private:
     QLabel* service_name_value_{nullptr};
     QLabel* service_id_value_{nullptr};
     QLabel* state_value_{nullptr};
+    QLabel* desired_state_value_{nullptr};
     QLabel* pid_value_{nullptr};
     QLabel* uptime_value_{nullptr};
     QLabel* auto_start_value_{nullptr};

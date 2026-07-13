@@ -19,31 +19,33 @@ public:
     [[nodiscard]] HttpResponse Handle(const HttpRequest& request);
 
 private:
-    [[nodiscard]] HttpResponse MakeServiceListResponse();
+    [[nodiscard]] HttpResponse MakeServiceListResponse() const;
 
     [[nodiscard]] HttpResponse MakeStatusResponse(ProcessSupervisor& supervisor);
 
     [[nodiscard]] HttpResponse MakeActionResponse(ProcessSupervisor& supervisor, std::string_view action);
 
-    [[nodiscard]] HttpResponse MakeLogsResponse(ProcessSupervisor& supervisor, std::size_t tail);
+    [[nodiscard]] HttpResponse MakeLogsResponse(const ProcessSupervisor& supervisor, std::size_t tail);
 
-    [[nodiscard]] HttpResponse MakeMetricsResponse(ProcessSupervisor& supervisor);
+    [[nodiscard]] HttpResponse MakeMetricsResponse(const ProcessSupervisor& supervisor) const;
 
-    [[nodiscard]] HttpResponse MakeMetricsHistoryResponse(ProcessSupervisor& supervisor, std::size_t limit);
+    [[nodiscard]] HttpResponse MakeMetricsHistoryResponse(const ProcessSupervisor& supervisor, std::size_t limit) const;
 
-    [[nodiscard]] HttpResponse MakeHealthResponse(ProcessSupervisor& supervisor);
+    [[nodiscard]] HttpResponse MakeHealthResponse(const ProcessSupervisor& supervisor) const;
 
-    [[nodiscard]] HttpResponse MakeServiceAlertsResponse(ProcessSupervisor& supervisor, bool include_resolved);
+    [[nodiscard]] HttpResponse MakeServiceAlertsResponse(const ProcessSupervisor& supervisor,
+                                                         bool include_resolved) const;
 
-    [[nodiscard]] HttpResponse MakeAllAlertsResponse(bool include_resolved, std::size_t resolved_limit);
+    [[nodiscard]] HttpResponse MakeAllAlertsResponse(bool include_resolved, std::size_t resolved_limit) const;
 
-    [[nodiscard]] HttpResponse MakeActiveAlertsResponse();
+    [[nodiscard]] HttpResponse MakeActiveAlertsResponse() const;
 
-    [[nodiscard]] HttpResponse MakeAcknowledgeAlertResponse(std::string_view alert_id);
+    [[nodiscard]] HttpResponse MakeAcknowledgeAlertResponse(std::string_view alert_id) const;
 
-    [[nodiscard]] HttpResponse MakeServiceRecoveryEventsResponse(ProcessSupervisor& supervisor, std::size_t limit);
+    [[nodiscard]] HttpResponse MakeServiceRecoveryEventsResponse(const ProcessSupervisor& supervisor,
+                                                                 std::size_t limit) const;
 
-    [[nodiscard]] HttpResponse MakeAllRecoveryEventsResponse(std::size_t limit);
+    [[nodiscard]] HttpResponse MakeAllRecoveryEventsResponse(std::size_t limit) const;
 
     [[nodiscard]] HttpResponse MakeMethodNotAllowed(std::string_view allow);
 

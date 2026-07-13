@@ -573,6 +573,7 @@ QUrl AgentClient::BuildServiceUrl(const QString& service_id, const QString& acti
 std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObject& object) {
     const QJsonValue id_value = object.value("id");
     const QJsonValue state_value = object.value("state");
+    const QJsonValue desired_state_value = object.value("desired_state");
     const QJsonValue display_name_value = object.value("display_name");
     const QJsonValue auto_start_value = object.value("auto_start");
     const QJsonValue pid_value = object.value("pid");
@@ -580,6 +581,7 @@ std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObje
     const QJsonValue exit_code_value = object.value("last_exit_code");
 
     if (!id_value.isString() || id_value.toString().isEmpty() || !state_value.isString()
+        || !desired_state_value.isString()
         || !display_name_value.isString() || !auto_start_value.isBool() || !pid_value.isDouble()
         || !uptime_value.isDouble()) {
         return std::nullopt;
@@ -594,6 +596,7 @@ std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObje
     snapshot.id = id_value.toString();
     snapshot.display_name = display_name_value.toString();
     snapshot.state = state_value.toString();
+    snapshot.desired_state = desired_state_value.toString();
     snapshot.auto_start = auto_start_value.toBool();
     snapshot.pid = static_cast<qint64>(pid_value.toDouble());
     snapshot.uptime_seconds = static_cast<qint64>(uptime_value.toDouble());

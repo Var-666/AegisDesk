@@ -28,6 +28,7 @@ struct ServiceSnapshot {
     QString id;
     QString display_name;
     QString state;
+    QString desired_state;
 
     bool auto_start{false};
 

@@ -15,6 +15,7 @@ add_executable(agent
         src/service/process_supervisor.cpp
         src/service/service_registry.cpp
         include/agent/service/log_reader.h
+        include/agent/service/desired_state.h
         include/agent/service/process_supervisor.h
         include/agent/service/service_definition.h
         include/agent/service/service_id.h

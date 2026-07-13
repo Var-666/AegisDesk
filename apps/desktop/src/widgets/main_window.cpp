@@ -36,7 +36,8 @@ constexpr int kRefreshIntervalMs = 1000;
 constexpr int kServiceIdRole = Qt::UserRole;
 
 QString ServiceListText(const ServiceSnapshot& service) {
-    return QString("%1\n%2  [%3]").arg(service.display_name, service.id, service.state);
+    return QString("%1\n%2  [%3, desired %4]")
+        .arg(service.display_name, service.id, service.state, service.desired_state);
 }
 
 void SetLabelsText(std::initializer_list<QLabel*> labels, const QString& text) {
@@ -155,6 +156,7 @@ QGroupBox* MainWindow::BuildServiceDetailsGroup(QWidget* parent) {
     ui::AddValueRow(service_layout, 2, 0, "Uptime:", uptime_value_, details_group_);
     ui::AddValueRow(service_layout, 2, 2, "Auto Start:", auto_start_value_, details_group_);
     ui::AddValueRow(service_layout, 3, 0, "Last Exit:", last_exit_value_, details_group_);
+    ui::AddValueRow(service_layout, 3, 2, "Desired:", desired_state_value_, details_group_);
 
     // 控制按钮区域
     auto* actions_layout = new QHBoxLayout();
@@ -543,6 +545,7 @@ void MainWindow::ApplySnapshot(const ServiceSnapshot& snapshot) {
     service_name_value_->setText(snapshot.display_name);
     service_id_value_->setText(snapshot.id);
     state_value_->setText(snapshot.state);
+    desired_state_value_->setText(snapshot.desired_state);
     pid_value_->setText(QString::number(snapshot.pid));
 
     uptime_value_->setText(FormatUptime(snapshot.uptime_seconds));
@@ -558,7 +561,7 @@ void MainWindow::ApplySnapshot(const ServiceSnapshot& snapshot) {
     UpdateActionButtons();
 }
 
-void MainWindow::ApplyMetrics(const ServiceMetricsSnapshot& metrics) {
+void MainWindow::ApplyMetrics(const ServiceMetricsSnapshot& metrics) const {
     last_sample_value_->setText(FormatSampleTime(metrics.collected_at_unix_ms));
 
     if (!metrics.available) {
@@ -593,8 +596,8 @@ void MainWindow::ClearCurrentServiceDetails() {
 
     details_group_->setTitle("Service Details");
 
-    SetLabelsText({service_name_value_, service_id_value_, state_value_, pid_value_, uptime_value_, auto_start_value_,
-                   last_exit_value_},
+    SetLabelsText({service_name_value_, service_id_value_, state_value_, desired_state_value_, pid_value_,
+                   uptime_value_, auto_start_value_, last_exit_value_},
                   "-");
 
     log_view_->clear();
@@ -623,7 +626,7 @@ void MainWindow::ShowMetricsNotReady() {
     SetLabelsText({cpu_value_, rss_value_, thread_count_value_, fd_count_value_, last_sample_value_}, "-");
 }
 
-void MainWindow::UpdateActionButtons() {
+void MainWindow::UpdateActionButtons() const {
     const bool service_running = current_state_ == "running";
 
     const bool can_control = has_snapshot_ && !current_service_id_.isEmpty() && !action_in_flight_;
@@ -641,7 +644,7 @@ void MainWindow::UpdateActionButtons() {
     service_list_->setEnabled(!action_in_flight_);
 }
 
-void MainWindow::ShowBackgroundError(const AgentError& error) {
+void MainWindow::ShowBackgroundError(const AgentError& error) const {
     QString message = error.message;
 
     if (message.isEmpty()) {
@@ -669,7 +672,7 @@ QString MainWindow::FormatBytes(const quint64 bytes) {
         "B", "KB", "MB", "GB", "TB",
     };
 
-    double value = static_cast<double>(bytes);
+    auto value = static_cast<double>(bytes);
     std::size_t unit_index = 0;
 
     while (value >= 1024.0 && unit_index + 1 < kUnits.size()) {

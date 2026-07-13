@@ -24,7 +24,8 @@ std::string ToString(const ServiceState state) {
 }
 
 ProcessSupervisor::ProcessSupervisor(ServiceDefinition definition)
-    : definition_(std::move(definition)) {
+    : definition_(std::move(definition))
+    , desired_state_(definition_.auto_start ? DesiredState::kRunning : DesiredState::kStopped) {
     if (definition_.IsStructurallyValid()) {
         definition_.executable = std::filesystem::absolute(definition_.executable);
         definition_.work_dir = std::filesystem::absolute(definition_.work_dir);
@@ -39,9 +40,12 @@ ProcessSupervisor::~ProcessSupervisor() noexcept {
     }
 }
 bool ProcessSupervisor::Start(std::string& error) {
+    error.clear();
+
     std::scoped_lock lock(mutex_);
 
-    error.clear();
+    desired_state_ = DesiredState::kRunning;
+
     ReapExitedChildLocked();
 
     if (!definition_.IsStructurallyValid()) {
@@ -64,10 +68,6 @@ bool ProcessSupervisor::Start(std::string& error) {
         return false;
     }
 
-    // execv() 需要 C 风格 argv：
-    // argv[0] = executable
-    // argv[1..n] = ServiceDefinition.args
-    // argv[n + 1] = nullptr
     std::vector<std::string> argv_storage;
     argv_storage.reserve(1 + definition_.args.size());
     argv_storage.push_back(definition_.executable.string());
@@ -117,9 +117,12 @@ bool ProcessSupervisor::Start(std::string& error) {
     return true;
 }
 bool ProcessSupervisor::Stop(std::string& error) {
+    error.clear();
+
     std::scoped_lock lock(mutex_);
 
-    error.clear();
+    desired_state_ = DesiredState::kStopped;
+
     ReapExitedChildLocked();
 
     if (pid_ <= 0) {
@@ -190,6 +193,7 @@ ServiceStatus ProcessSupervisor::GetStatus() {
 
     ServiceStatus status;
     status.state = pid_ > 0 ? ServiceState::kRunning : ServiceState::kStopped;
+    status.desired_state = desired_state_;
     status.pid = pid_;
     status.exit_code = last_exit_code_;
 
@@ -201,7 +205,16 @@ ServiceStatus ProcessSupervisor::GetStatus() {
     return status;
 }
 const ServiceDefinition& ProcessSupervisor::Definition() const noexcept {
+    std::scoped_lock lock(mutex_);
     return definition_;
+}
+DesiredState ProcessSupervisor::GetDesiredState() const {
+    std::scoped_lock lock(mutex_);
+    return desired_state_;
+}
+void ProcessSupervisor::SetDesiredState(const DesiredState desired_state) {
+    std::scoped_lock lock(mutex_);
+    desired_state_ = desired_state;
 }
 bool ProcessSupervisor::ReapExitedChildLocked() {
     if (pid_ <= 0) {
