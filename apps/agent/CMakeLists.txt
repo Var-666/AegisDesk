@@ -1,15 +1,11 @@
 find_package(Boost 1.74 REQUIRED)
 find_package(Threads REQUIRED)
 
-add_executable(agent
-        main.cpp
-
+add_library(aegis_agent_core STATIC
         src/api/agent_api.cpp
         src/api/http_json.cpp
-        src/api/http_server.cpp
         include/agent/api/agent_api.h
         include/agent/api/http_json.h
-        include/agent/api/http_server.h
 
         src/service/log_reader.cpp
         src/service/process_supervisor.cpp
@@ -47,29 +43,43 @@ add_executable(agent
 )
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_sources(agent PRIVATE src/metrics/linux_metrics_reader.cpp)
+    target_sources(aegis_agent_core PRIVATE src/metrics/linux_metrics_reader.cpp)
 elseif (APPLE)
-    target_sources(agent PRIVATE src/metrics/macos_metrics_reader.cpp)
+    target_sources(aegis_agent_core PRIVATE src/metrics/macos_metrics_reader.cpp)
     find_library(AEGIS_LIBPROC_LIBRARY NAMES proc)
 
     if (NOT AEGIS_LIBPROC_LIBRARY)
         message(FATAL_ERROR "macOS libproc library was not found")
     endif ()
 
-    target_link_libraries(agent PRIVATE ${AEGIS_LIBPROC_LIBRARY})
+    target_link_libraries(aegis_agent_core PRIVATE ${AEGIS_LIBPROC_LIBRARY})
 else ()
-    target_sources(agent PRIVATE src/metrics/unsupported_metrics_reader.cpp)
+    target_sources(aegis_agent_core PRIVATE src/metrics/unsupported_metrics_reader.cpp)
 endif ()
 
-target_include_directories(agent PRIVATE include)
-target_include_directories(agent SYSTEM PRIVATE ${Boost_INCLUDE_DIRS})
+target_include_directories(aegis_agent_core
+        PUBLIC include
+        SYSTEM PRIVATE ${Boost_INCLUDE_DIRS}
+)
 
-target_link_libraries(agent PRIVATE Threads::Threads Boost::headers)
+target_link_libraries(aegis_agent_core PUBLIC Threads::Threads Boost::headers)
 
 # Boost.System 使用头文件模式，避免额外链接库配置问题。
-target_compile_definitions(agent PRIVATE
+target_compile_definitions(aegis_agent_core PUBLIC
         BOOST_ERROR_CODE_HEADER_ONLY
 )
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(aegis_agent_core PRIVATE -Wall -Wextra -Wpedantic)
+endif ()
+
+add_executable(agent
+        main.cpp
+        src/api/http_server.cpp
+        include/agent/api/http_server.h
+)
+
+target_link_libraries(agent PRIVATE aegis_agent_core)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agent PRIVATE -Wall -Wextra -Wpedantic)

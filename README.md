@@ -65,6 +65,25 @@ build/apps/demo_service/demo_service
 
 Note: the top-level `CMakeLists.txt` currently sets a Homebrew Boost path. On non-Homebrew systems, remove that line or pass the proper Boost location through CMake.
 
+## Testing
+
+Tests use GoogleTest through CTest. GoogleTest is fetched at a pinned revision when `BUILD_TESTING` is enabled.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The test build also creates `aegis_fault_process`, a deterministic helper used by process-supervision integration tests.
+
+To build only the product targets without downloading or compiling test dependencies:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build
+```
+
 ## Run
 
 Start the agent from the project root:
@@ -143,5 +162,6 @@ The desktop shows current metrics in the Overview tab and historical charts in t
 - Agent HTTP handling is synchronous and single-connection oriented.
 - Service config is loaded at agent startup; hot reload is not implemented.
 - No authentication, TLS, audit log, or permission model yet.
-- No automated tests are currently included.
+- Test coverage currently focuses on model validation and process health-check behavior; process lifecycle, alerting,
+  recovery, API, and desktop coverage are being expanded.
 - Metrics are stored in memory only; there is no persistent history database.
