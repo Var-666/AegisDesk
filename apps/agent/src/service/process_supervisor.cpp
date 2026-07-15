@@ -12,6 +12,13 @@
 #include <unistd.h>
 
 namespace aegis::agent {
+namespace {
+
+constexpr auto kGracefulStopTimeout = std::chrono::seconds(3);
+constexpr auto kForcedStopTimeout = std::chrono::seconds(3);
+constexpr auto kExitPollInterval = std::chrono::milliseconds(25);
+
+} // namespace
 
 std::string ToString(const ServiceState state) {
     switch (state) {
@@ -63,35 +70,103 @@ ProcessSupervisor::~ProcessSupervisor() noexcept {
     }
 }
 bool ProcessSupervisor::Start(std::string& error) {
-    error.clear();
+    std::scoped_lock operation_lock(operation_mutex_);
+    return StartOperation(error);
+}
+bool ProcessSupervisor::Stop(std::string& error) {
+    std::scoped_lock operation_lock(operation_mutex_);
+    return StopOperation(error, DesiredState::kStopped);
+}
+bool ProcessSupervisor::Restart(std::string& error) {
+    std::scoped_lock operation_lock(operation_mutex_);
 
-    std::scoped_lock lock(mutex_);
+    {
+        std::scoped_lock state_lock(state_mutex_);
+        desired_state_ = DesiredState::kRunning;
+    }
 
-    desired_state_ = DesiredState::kRunning;
-
-    ReapExitedChildLocked();
-
-    if (pid_ > 0) {
-        error = definition_.id + " is already running";
+    if (!StopOperation(error, DesiredState::kRunning)) {
         return false;
     }
 
-    TransitionStateLocked(ServiceState::kStarting);
+    return StartOperation(error);
+}
+ServiceStatus ProcessSupervisor::GetStatus() {
+    std::scoped_lock state_lock(state_mutex_);
+
+    // StopOperation is the sole reaper while a stop is in progress. This
+    // prevents status polling from racing with the operation's waitpid calls.
+    if (state_ != ServiceState::kStopping) {
+        ReapExitedChildLocked();
+    }
+
+    ServiceStatus status;
+    status.state = state_;
+    status.desired_state = desired_state_;
+    status.pid = pid_;
+    status.exit_code = last_exit_code_;
+    status.last_exit_kind = last_exit_kind_;
+    status.last_exit_signal = last_exit_signal_;
+    status.last_error = last_error_;
+    status.last_transition_at_unix_ms = last_transition_at_unix_ms_;
+
+    if (start_time_.has_value()) {
+        status.uptime =
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - *start_time_);
+    }
+
+    return status;
+}
+const ServiceDefinition& ProcessSupervisor::Definition() const noexcept {
+    return definition_;
+}
+DesiredState ProcessSupervisor::GetDesiredState() const {
+    std::scoped_lock state_lock(state_mutex_);
+    return desired_state_;
+}
+void ProcessSupervisor::SetDesiredState(const DesiredState desired_state) {
+    std::scoped_lock operation_lock(operation_mutex_);
+    std::scoped_lock state_lock(state_mutex_);
+    desired_state_ = desired_state;
+}
+bool ProcessSupervisor::StartOperation(std::string& error) {
+    error.clear();
+
+    {
+        std::scoped_lock state_lock(state_mutex_);
+
+        desired_state_ = DesiredState::kRunning;
+
+        ReapExitedChildLocked();
+
+        if (pid_ > 0) {
+            error = definition_.id + " is already running";
+            return false;
+        }
+
+        TransitionStateLocked(ServiceState::kStarting);
+    }
 
     if (!definition_.IsStructurallyValid()) {
         error = "invalid service definition: " + definition_.id;
+
+        std::scoped_lock state_lock(state_mutex_);
         TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
     if (!std::filesystem::exists(definition_.executable)) {
         error = "service executable does not exist: " + definition_.executable.string();
+
+        std::scoped_lock state_lock(state_mutex_);
         TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
     if (!std::filesystem::exists(definition_.work_dir) || !std::filesystem::is_directory(definition_.work_dir)) {
         error = "service work directory does not exist or is not a directory: " + definition_.work_dir.string();
+
+        std::scoped_lock state_lock(state_mutex_);
         TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
@@ -121,6 +196,8 @@ bool ProcessSupervisor::Start(std::string& error) {
 
     if (child_pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
+
+        std::scoped_lock state_lock(state_mutex_);
         TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
@@ -139,124 +216,99 @@ bool ProcessSupervisor::Start(std::string& error) {
         _exit(127);
     }
 
-    pid_ = child_pid;
-    start_time_ = std::chrono::steady_clock::now();
-    TransitionStateLocked(ServiceState::kRunning);
+    {
+        std::scoped_lock state_lock(state_mutex_);
+
+        pid_ = child_pid;
+        start_time_ = std::chrono::steady_clock::now();
+        TransitionStateLocked(ServiceState::kRunning);
+    }
 
     return true;
 }
-bool ProcessSupervisor::Stop(std::string& error) {
+bool ProcessSupervisor::StopOperation(std::string& error, const DesiredState final_desired_state) {
     error.clear();
 
-    std::scoped_lock lock(mutex_);
+    pid_t target_pid = -1;
 
-    desired_state_ = DesiredState::kStopped;
+    {
+        std::scoped_lock state_lock(state_mutex_);
 
-    ReapExitedChildLocked();
+        desired_state_ = final_desired_state;
 
-    if (pid_ <= 0) {
-        if (state_ != ServiceState::kStopped) {
-            TransitionStateLocked(ServiceState::kStopped);
-        }
-        return true;
-    }
+        ReapExitedChildLocked();
 
-    const pid_t target_pid = pid_;
-
-    TransitionStateLocked(ServiceState::kStopping);
-
-    if (kill(target_pid, SIGTERM) != 0 && errno != ESRCH) {
-        error = std::string("SIGTERM failed: ") + std::strerror(errno);
-        TransitionStateLocked(ServiceState::kFailed, error);
-        return false;
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (ReapExitedChildLocked()) {
+        if (pid_ <= 0) {
+            if (final_desired_state == DesiredState::kStopped && state_ != ServiceState::kStopped) {
+                TransitionStateLocked(ServiceState::kStopped);
+            }
             return true;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        target_pid = pid_;
+
+        TransitionStateLocked(ServiceState::kStopping);
+    }
+
+    if (kill(target_pid, SIGTERM) != 0 && errno != ESRCH) {
+        error = std::string("SIGTERM failed: ") + std::strerror(errno);
+
+        std::scoped_lock state_lock(state_mutex_);
+        if (pid_ == target_pid) {
+            TransitionStateLocked(ServiceState::kFailed, error);
+        }
+        return false;
+    }
+
+    if (WaitForExit(target_pid, std::chrono::steady_clock::now() + kGracefulStopTimeout)) {
+        return true;
     }
 
     if (kill(target_pid, SIGKILL) != 0 && errno != ESRCH) {
         error = std::string("SIGKILL failed: ") + std::strerror(errno);
-        TransitionStateLocked(ServiceState::kFailed, error);
+
+        std::scoped_lock state_lock(state_mutex_);
+        if (pid_ == target_pid) {
+            TransitionStateLocked(ServiceState::kFailed, error);
+        }
         return false;
     }
 
-    int status = 0;
+    if (WaitForExit(target_pid, std::chrono::steady_clock::now() + kForcedStopTimeout)) {
+        return true;
+    }
 
+    error = "timed out waiting for service to exit after SIGKILL: " + definition_.id;
+
+    {
+        std::scoped_lock state_lock(state_mutex_);
+        if (pid_ == target_pid) {
+            TransitionStateLocked(ServiceState::kFailed, error);
+        }
+    }
+
+    return false;
+}
+bool ProcessSupervisor::WaitForExit(const pid_t target_pid, const std::chrono::steady_clock::time_point deadline) {
     while (true) {
-        const pid_t result = waitpid(target_pid, &status, 0);
+        {
+            std::scoped_lock state_lock(state_mutex_);
 
-        if (result == target_pid) {
-            SaveExitStatusLocked(status);
-            break;
+            if (pid_ != target_pid) {
+                return true;
+            }
+
+            if (ReapExitedChildLocked()) {
+                return true;
+            }
         }
 
-        if (result < 0 && errno == EINTR) {
-            continue;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
         }
 
-        if (result < 0 && errno == ECHILD) {
-            last_exit_code_.reset();
-            last_exit_kind_ = ProcessExitKind::kUnknown;
-            last_exit_signal_.reset();
-            break;
-        }
-
-        error = std::string("waitpid failed: ") + std::strerror(errno);
-        TransitionStateLocked(ServiceState::kFailed, error);
-        return false;
+        std::this_thread::sleep_for(kExitPollInterval);
     }
-
-    MarkChildExitedLocked();
-
-    return true;
-}
-bool ProcessSupervisor::Restart(std::string& error) {
-    if (!Stop(error)) {
-        return false;
-    }
-
-    return Start(error);
-}
-ServiceStatus ProcessSupervisor::GetStatus() {
-    std::scoped_lock lock(mutex_);
-
-    ReapExitedChildLocked();
-
-    ServiceStatus status;
-    status.state = state_;
-    status.desired_state = desired_state_;
-    status.pid = pid_;
-    status.exit_code = last_exit_code_;
-    status.last_exit_kind = last_exit_kind_;
-    status.last_exit_signal = last_exit_signal_;
-    status.last_error = last_error_;
-    status.last_transition_at_unix_ms = last_transition_at_unix_ms_;
-
-    if (start_time_.has_value()) {
-        status.uptime =
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - *start_time_);
-    }
-
-    return status;
-}
-const ServiceDefinition& ProcessSupervisor::Definition() const noexcept {
-    std::scoped_lock lock(mutex_);
-    return definition_;
-}
-DesiredState ProcessSupervisor::GetDesiredState() const {
-    std::scoped_lock lock(mutex_);
-    return desired_state_;
-}
-void ProcessSupervisor::SetDesiredState(const DesiredState desired_state) {
-    std::scoped_lock lock(mutex_);
-    desired_state_ = desired_state;
 }
 bool ProcessSupervisor::ReapExitedChildLocked() {
     if (pid_ <= 0) {

@@ -67,6 +67,10 @@ public:
     void SetDesiredState(DesiredState desired_state);
 
 private:
+    bool StartOperation(std::string& error);
+    bool StopOperation(std::string& error, DesiredState final_desired_state);
+    bool WaitForExit(pid_t target_pid, std::chrono::steady_clock::time_point deadline);
+
     bool ReapExitedChildLocked();
     void SaveExitStatusLocked(int status);
     void MarkChildExitedLocked();
@@ -78,7 +82,8 @@ private:
     ServiceDefinition definition_;
     DesiredState desired_state_{DesiredState::kStopped};
 
-    mutable std::mutex mutex_;
+    std::mutex operation_mutex_;
+    mutable std::mutex state_mutex_;
 
     ServiceState state_{ServiceState::kStopped};
     pid_t pid_{-1};
