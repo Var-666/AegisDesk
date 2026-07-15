@@ -17,15 +17,38 @@ std::string ToString(const ServiceState state) {
     switch (state) {
         case ServiceState::kStopped:
             return "Stopped";
+        case ServiceState::kStarting:
+            return "Starting";
         case ServiceState::kRunning:
             return "Running";
+        case ServiceState::kStopping:
+            return "Stopping";
+        case ServiceState::kExited:
+            return "Exited";
+        case ServiceState::kFailed:
+            return "Failed";
     }
     return "Unknown";
 }
 
+std::string ToString(const ProcessExitKind kind) {
+    switch (kind) {
+        case ProcessExitKind::kNone:
+            return "none";
+        case ProcessExitKind::kExited:
+            return "exited";
+        case ProcessExitKind::kSignaled:
+            return "signaled";
+        case ProcessExitKind::kUnknown:
+            return "unknown";
+    }
+    return "unknown";
+}
+
 ProcessSupervisor::ProcessSupervisor(ServiceDefinition definition)
     : definition_(std::move(definition))
-    , desired_state_(definition_.auto_start ? DesiredState::kRunning : DesiredState::kStopped) {
+    , desired_state_(definition_.auto_start ? DesiredState::kRunning : DesiredState::kStopped)
+    , last_transition_at_unix_ms_(NowUnixTimeMilliseconds()) {
     if (definition_.IsStructurallyValid()) {
         definition_.executable = std::filesystem::absolute(definition_.executable);
         definition_.work_dir = std::filesystem::absolute(definition_.work_dir);
@@ -48,23 +71,28 @@ bool ProcessSupervisor::Start(std::string& error) {
 
     ReapExitedChildLocked();
 
-    if (!definition_.IsStructurallyValid()) {
-        error = "invalid service definition: " + definition_.id;
+    if (pid_ > 0) {
+        error = definition_.id + " is already running";
         return false;
     }
 
-    if (pid_ > 0) {
-        error = "demo_service is already running";
+    TransitionStateLocked(ServiceState::kStarting);
+
+    if (!definition_.IsStructurallyValid()) {
+        error = "invalid service definition: " + definition_.id;
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
     if (!std::filesystem::exists(definition_.executable)) {
         error = "service executable does not exist: " + definition_.executable.string();
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
     if (!std::filesystem::exists(definition_.work_dir) || !std::filesystem::is_directory(definition_.work_dir)) {
         error = "service work directory does not exist or is not a directory: " + definition_.work_dir.string();
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
@@ -93,6 +121,7 @@ bool ProcessSupervisor::Start(std::string& error) {
 
     if (child_pid < 0) {
         error = std::string("fork failed: ") + std::strerror(errno);
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
@@ -111,8 +140,8 @@ bool ProcessSupervisor::Start(std::string& error) {
     }
 
     pid_ = child_pid;
-    last_exit_code_.reset();
     start_time_ = std::chrono::steady_clock::now();
+    TransitionStateLocked(ServiceState::kRunning);
 
     return true;
 }
@@ -126,13 +155,19 @@ bool ProcessSupervisor::Stop(std::string& error) {
     ReapExitedChildLocked();
 
     if (pid_ <= 0) {
+        if (state_ != ServiceState::kStopped) {
+            TransitionStateLocked(ServiceState::kStopped);
+        }
         return true;
     }
 
     const pid_t target_pid = pid_;
 
+    TransitionStateLocked(ServiceState::kStopping);
+
     if (kill(target_pid, SIGTERM) != 0 && errno != ESRCH) {
         error = std::string("SIGTERM failed: ") + std::strerror(errno);
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
@@ -148,6 +183,7 @@ bool ProcessSupervisor::Stop(std::string& error) {
 
     if (kill(target_pid, SIGKILL) != 0 && errno != ESRCH) {
         error = std::string("SIGKILL failed: ") + std::strerror(errno);
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
@@ -167,15 +203,17 @@ bool ProcessSupervisor::Stop(std::string& error) {
 
         if (result < 0 && errno == ECHILD) {
             last_exit_code_.reset();
+            last_exit_kind_ = ProcessExitKind::kUnknown;
+            last_exit_signal_.reset();
             break;
         }
 
         error = std::string("waitpid failed: ") + std::strerror(errno);
+        TransitionStateLocked(ServiceState::kFailed, error);
         return false;
     }
 
-    pid_ = -1;
-    start_time_.reset();
+    MarkChildExitedLocked();
 
     return true;
 }
@@ -192,10 +230,14 @@ ServiceStatus ProcessSupervisor::GetStatus() {
     ReapExitedChildLocked();
 
     ServiceStatus status;
-    status.state = pid_ > 0 ? ServiceState::kRunning : ServiceState::kStopped;
+    status.state = state_;
     status.desired_state = desired_state_;
     status.pid = pid_;
     status.exit_code = last_exit_code_;
+    status.last_exit_kind = last_exit_kind_;
+    status.last_exit_signal = last_exit_signal_;
+    status.last_error = last_error_;
+    status.last_transition_at_unix_ms = last_transition_at_unix_ms_;
 
     if (start_time_.has_value()) {
         status.uptime =
@@ -230,15 +272,15 @@ bool ProcessSupervisor::ReapExitedChildLocked() {
 
     if (result == pid_) {
         SaveExitStatusLocked(status);
-        pid_ = -1;
-        start_time_.reset();
+        MarkChildExitedLocked();
         return true;
     }
 
     if (result < 0 && errno == ECHILD) {
-        pid_ = -1;
         last_exit_code_.reset();
-        start_time_.reset();
+        last_exit_kind_ = ProcessExitKind::kUnknown;
+        last_exit_signal_.reset();
+        MarkChildExitedLocked();
         return true;
     }
 
@@ -247,14 +289,39 @@ bool ProcessSupervisor::ReapExitedChildLocked() {
 void ProcessSupervisor::SaveExitStatusLocked(int status) {
     if (WIFEXITED(status)) {
         last_exit_code_ = WEXITSTATUS(status);
+        last_exit_kind_ = ProcessExitKind::kExited;
+        last_exit_signal_.reset();
         return;
     }
 
     if (WIFSIGNALED(status)) {
-        last_exit_code_ = 128 + WTERMSIG(status);
+        const int signal = WTERMSIG(status);
+        last_exit_code_ = 128 + signal;
+        last_exit_kind_ = ProcessExitKind::kSignaled;
+        last_exit_signal_ = signal;
         return;
     }
 
     last_exit_code_.reset();
+    last_exit_kind_ = ProcessExitKind::kUnknown;
+    last_exit_signal_.reset();
+}
+void ProcessSupervisor::MarkChildExitedLocked() {
+    pid_ = -1;
+    start_time_.reset();
+
+    const bool explicitly_stopped = desired_state_ == DesiredState::kStopped || state_ == ServiceState::kStopping;
+    TransitionStateLocked(explicitly_stopped ? ServiceState::kStopped : ServiceState::kExited);
+}
+void ProcessSupervisor::TransitionStateLocked(const ServiceState state, std::string error) {
+    state_ = state;
+    last_error_ = std::move(error);
+    last_transition_at_unix_ms_ = NowUnixTimeMilliseconds();
+}
+UnixTimeMilliseconds ProcessSupervisor::NowUnixTimeMilliseconds() noexcept {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+
+    return milliseconds < 0 ? 0 : static_cast<UnixTimeMilliseconds>(milliseconds);
 }
 } // namespace aegis::agent

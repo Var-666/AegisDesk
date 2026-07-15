@@ -15,6 +15,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include <unistd.h>
 
@@ -86,6 +87,16 @@ public:
 
     ServiceDefinitionBuilder& WithAutoStart(const bool auto_start) {
         definition_.auto_start = auto_start;
+        return *this;
+    }
+
+    ServiceDefinitionBuilder& WithExecutable(std::filesystem::path executable) {
+        definition_.executable = std::move(executable);
+        return *this;
+    }
+
+    ServiceDefinitionBuilder& WithArgs(std::vector<std::string> args) {
+        definition_.args = std::move(args);
         return *this;
     }
 

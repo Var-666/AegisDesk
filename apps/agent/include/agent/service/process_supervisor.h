@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agent/metrics/service_metrics.h"
 #include "agent/service/desired_state.h"
 #include "agent/service/service_definition.h"
 
@@ -14,10 +15,23 @@
 namespace aegis::agent {
 enum class ServiceState {
     kStopped,
+    kStarting,
     kRunning,
+    kStopping,
+    kExited,
+    kFailed,
 };
 
 [[nodiscard]] std::string ToString(ServiceState state);
+
+enum class ProcessExitKind {
+    kNone,
+    kExited,
+    kSignaled,
+    kUnknown,
+};
+
+[[nodiscard]] std::string ToString(ProcessExitKind kind);
 
 struct ServiceStatus {
     ServiceState state{ServiceState::kStopped};
@@ -25,6 +39,10 @@ struct ServiceStatus {
     pid_t pid{-1};
     std::optional<int> exit_code;
     std::chrono::seconds uptime{0};
+    ProcessExitKind last_exit_kind{ProcessExitKind::kNone};
+    std::optional<int> last_exit_signal;
+    std::string last_error;
+    UnixTimeMilliseconds last_transition_at_unix_ms{0};
 };
 
 class ProcessSupervisor {
@@ -51,6 +69,10 @@ public:
 private:
     bool ReapExitedChildLocked();
     void SaveExitStatusLocked(int status);
+    void MarkChildExitedLocked();
+    void TransitionStateLocked(ServiceState state, std::string error = {});
+
+    [[nodiscard]] static UnixTimeMilliseconds NowUnixTimeMilliseconds() noexcept;
 
 private:
     ServiceDefinition definition_;
@@ -58,8 +80,13 @@ private:
 
     mutable std::mutex mutex_;
 
+    ServiceState state_{ServiceState::kStopped};
     pid_t pid_{-1};
     std::optional<int> last_exit_code_;
+    ProcessExitKind last_exit_kind_{ProcessExitKind::kNone};
+    std::optional<int> last_exit_signal_;
+    std::string last_error_;
+    UnixTimeMilliseconds last_transition_at_unix_ms_{0};
     std::optional<std::chrono::steady_clock::time_point> start_time_;
 };
 } // namespace aegis::agent

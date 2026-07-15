@@ -21,6 +21,7 @@ endif ()
 add_executable(aegis_agent_core_tests
         unit/model_validation_test.cpp
         unit/health_checker_test.cpp
+        unit/process_supervisor_state_test.cpp
         support/test_builders.h
 )
 
