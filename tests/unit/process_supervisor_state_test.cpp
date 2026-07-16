@@ -6,12 +6,18 @@
 
 #include <atomic>
 #include <barrier>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <fstream>
+#include <functional>
 #include <future>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <sys/stat.h>
 
 namespace aegis::test {
 namespace {
@@ -61,6 +67,57 @@ TEST(ProcessSupervisorStateTest, InvalidExecutableTransitionsToFailed) {
     EXPECT_EQ(status.pid, -1);
     EXPECT_EQ(status.last_error, error);
     EXPECT_NE(error.find("does not exist"), std::string::npos);
+}
+
+TEST(ProcessSupervisorStateTest, NonExecutableFileReportsExecPermissionFailure) {
+    ScopedTempDirectory directory("supervisor-not-executable");
+    const std::filesystem::path executable = directory.Path() / "not-executable";
+    {
+        std::ofstream file(executable);
+        ASSERT_TRUE(file.is_open());
+        file << "#!/bin/sh\nexit 0\n";
+    }
+    ASSERT_EQ(chmod(executable.c_str(), 0644), 0);
+
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path()).WithExecutable(executable).Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_FALSE(supervisor.Start(error));
+
+    const agent::ServiceStatus status = supervisor.GetStatus();
+    EXPECT_EQ(status.state, agent::ServiceState::kFailed);
+    EXPECT_EQ(status.desired_state, agent::DesiredState::kRunning);
+    EXPECT_EQ(status.pid, -1);
+    EXPECT_EQ(status.last_error, error);
+    EXPECT_NE(error.find("execv('" + executable.string() + "')"), std::string::npos);
+    EXPECT_NE(error.find(std::strerror(EACCES)), std::string::npos);
+}
+
+TEST(ProcessSupervisorStateTest, InvalidExecutableFormatReportsExecFailure) {
+    ScopedTempDirectory directory("supervisor-invalid-format");
+    const std::filesystem::path executable = directory.Path() / "invalid-format";
+    {
+        std::ofstream file(executable);
+        ASSERT_TRUE(file.is_open());
+        file << "this is not an executable image\n";
+    }
+    ASSERT_EQ(chmod(executable.c_str(), 0755), 0);
+
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path()).WithExecutable(executable).Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_FALSE(supervisor.Start(error));
+
+    const agent::ServiceStatus status = supervisor.GetStatus();
+    EXPECT_EQ(status.state, agent::ServiceState::kFailed);
+    EXPECT_EQ(status.pid, -1);
+    EXPECT_EQ(status.last_error, error);
+    EXPECT_NE(error.find("execv('" + executable.string() + "')"), std::string::npos);
+    EXPECT_NE(error.find(std::strerror(ENOEXEC)), std::string::npos);
 }
 
 TEST(ProcessSupervisorStateTest, StartAndStopFollowRunningLifecycle) {
@@ -166,6 +223,42 @@ TEST(ProcessSupervisorConcurrencyTest, ConcurrentStartsCreateOnlyOneProcess) {
 
     std::string error;
     EXPECT_TRUE(supervisor.Stop(error)) << error;
+}
+
+TEST(ProcessSupervisorConcurrencyTest, DifferentServicesCanStartConcurrentlyWithoutPipeCrosstalk) {
+    ScopedTempDirectory directory("supervisor-parallel-services");
+    const std::filesystem::path first_ready_file = directory.Path() / "first-ready";
+    const std::filesystem::path second_ready_file = directory.Path() / "second-ready";
+    agent::ProcessSupervisor first_supervisor(ServiceDefinitionBuilder(directory.Path())
+                                                  .WithId("first_service")
+                                                  .WithArgs({"--ready-file", first_ready_file.string()})
+                                                  .Build());
+    agent::ProcessSupervisor second_supervisor(ServiceDefinitionBuilder(directory.Path())
+                                                   .WithId("second_service")
+                                                   .WithArgs({"--ready-file", second_ready_file.string()})
+                                                   .Build());
+    std::barrier start_gate(2);
+
+    const auto start_service = [&](agent::ProcessSupervisor& supervisor) {
+        start_gate.arrive_and_wait();
+        std::string error;
+        const bool succeeded = supervisor.Start(error);
+        return std::pair{succeeded, error};
+    };
+
+    auto first_start = std::async(std::launch::async, start_service, std::ref(first_supervisor));
+    auto second_start = std::async(std::launch::async, start_service, std::ref(second_supervisor));
+
+    const auto [first_succeeded, first_error] = first_start.get();
+    const auto [second_succeeded, second_error] = second_start.get();
+    ASSERT_TRUE(first_succeeded) << first_error;
+    ASSERT_TRUE(second_succeeded) << second_error;
+    EXPECT_TRUE(WaitUntil([&] { return std::filesystem::exists(first_ready_file); }));
+    EXPECT_TRUE(WaitUntil([&] { return std::filesystem::exists(second_ready_file); }));
+
+    std::string error;
+    EXPECT_TRUE(first_supervisor.Stop(error)) << error;
+    EXPECT_TRUE(second_supervisor.Stop(error)) << error;
 }
 
 TEST(ProcessSupervisorConcurrencyTest, StatusRemainsResponsiveWhileStopWaits) {

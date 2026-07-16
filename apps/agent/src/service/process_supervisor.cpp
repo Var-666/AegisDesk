@@ -1,13 +1,14 @@
-//
-// Created by Var on 2026/7/3.
-//
-
 #include "agent/service/process_supervisor.h"
 
+#include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <iostream>
 #include <thread>
+#include <vector>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,173 @@ namespace {
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(3);
 constexpr auto kForcedStopTimeout = std::chrono::seconds(3);
 constexpr auto kExitPollInterval = std::chrono::milliseconds(25);
+constexpr auto kExecConfirmationTimeout = std::chrono::seconds(5);
+
+// Serializing pipe setup and fork prevents one concurrently-starting child
+// from inheriting another service's exec-confirmation writer.
+std::mutex g_fork_mutex;
+
+enum class ChildStartStage : int {
+    kChangeDirectory = 1,
+    kOpenNullDevice,
+    kRedirectStandardOutput,
+    kRedirectStandardError,
+    kExecute,
+};
+
+struct ChildStartError {
+    ChildStartStage stage;
+    int error_number;
+};
+
+enum class ExecConfirmationResult {
+    kSucceeded,
+    kChildFailed,
+    kTimedOut,
+    kPipeFailed,
+};
+
+bool SetCloseOnExec(const int file_descriptor) {
+    const int flags = fcntl(file_descriptor, F_GETFD);
+    return flags >= 0 && fcntl(file_descriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+bool MovePipeDescriptorsAboveStandardStreams(int (&error_pipe)[2]) {
+    for (int& file_descriptor : error_pipe) {
+        if (file_descriptor > STDERR_FILENO) {
+            continue;
+        }
+
+        const int moved_descriptor = fcntl(file_descriptor, F_DUPFD, STDERR_FILENO + 1);
+        if (moved_descriptor < 0) {
+            return false;
+        }
+
+        close(file_descriptor);
+        file_descriptor = moved_descriptor;
+    }
+
+    return true;
+}
+
+void ReportChildStartErrorAndExit(const int error_pipe, const ChildStartStage stage, const int error_number) {
+    const ChildStartError message{
+        .stage = stage,
+        .error_number = error_number,
+    };
+
+    auto data = reinterpret_cast<const char*>(&message);
+    std::size_t remaining = sizeof(message);
+
+    while (remaining > 0) {
+        const ssize_t written = write(error_pipe, data, remaining);
+
+        if (written > 0) {
+            data += written;
+            remaining -= static_cast<std::size_t>(written);
+            continue;
+        }
+
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+
+        break;
+    }
+
+    _exit(127);
+}
+
+ExecConfirmationResult WaitForExecConfirmation(const int error_pipe, ChildStartError& child_error,
+                                               int& pipe_error_number) {
+    const auto deadline = std::chrono::steady_clock::now() + kExecConfirmationTimeout;
+    const auto destination = reinterpret_cast<char*>(&child_error);
+    std::size_t bytes_read = 0;
+
+    while (true) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            return ExecConfirmationResult::kTimedOut;
+        }
+
+        const auto remaining_milliseconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(remaining + std::chrono::milliseconds(1));
+        pollfd descriptor{
+            .fd = error_pipe,
+            .events = POLLIN,
+            .revents = 0,
+        };
+
+        const int poll_result = poll(&descriptor, 1, static_cast<int>(remaining_milliseconds.count()));
+
+        if (poll_result == 0) {
+            return ExecConfirmationResult::kTimedOut;
+        }
+
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            pipe_error_number = errno;
+            return ExecConfirmationResult::kPipeFailed;
+        }
+
+        const ssize_t result = read(error_pipe, destination + bytes_read, sizeof(child_error) - bytes_read);
+
+        if (result == 0) {
+            if (bytes_read == 0) {
+                return ExecConfirmationResult::kSucceeded;
+            }
+
+            pipe_error_number = EPROTO;
+            return ExecConfirmationResult::kPipeFailed;
+        }
+
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            pipe_error_number = errno;
+            return ExecConfirmationResult::kPipeFailed;
+        }
+
+        bytes_read += static_cast<std::size_t>(result);
+        if (bytes_read == sizeof(child_error)) {
+            return ExecConfirmationResult::kChildFailed;
+        }
+    }
+}
+
+void ReapChildBlocking(const pid_t child_pid) {
+    while (waitpid(child_pid, nullptr, 0) < 0 && errno == EINTR) {}
+}
+
+std::string DescribeChildStartError(const ChildStartError& child_error, const std::string& executable_path,
+                                    const std::string& work_dir) {
+    std::string operation;
+
+    switch (child_error.stage) {
+        case ChildStartStage::kChangeDirectory:
+            operation = "chdir('" + work_dir + "')";
+            break;
+        case ChildStartStage::kOpenNullDevice:
+            operation = "open('/dev/null')";
+            break;
+        case ChildStartStage::kRedirectStandardOutput:
+            operation = "redirect stdout";
+            break;
+        case ChildStartStage::kRedirectStandardError:
+            operation = "redirect stderr";
+            break;
+        case ChildStartStage::kExecute:
+            operation = "execv('" + executable_path + "')";
+            break;
+    }
+
+    return "service startup failed during " + operation + ": " + std::strerror(child_error.error_number);
+}
 
 } // namespace
 
@@ -191,11 +359,50 @@ bool ProcessSupervisor::StartOperation(std::string& error) {
 
     const std::string executable_path = definition_.executable.string();
     const std::string work_dir = definition_.work_dir.string();
+    char* const* const argv_data = argv.data();
+    const char* const executable_path_data = executable_path.c_str();
+    const char* const work_dir_data = work_dir.c_str();
+
+    int error_pipe[2] = {-1, -1};
+    std::unique_lock fork_lock(g_fork_mutex);
+
+    if (pipe(error_pipe) != 0) {
+        error = std::string("failed to create exec confirmation pipe: ") + std::strerror(errno);
+
+        std::scoped_lock state_lock(state_mutex_);
+        TransitionStateLocked(ServiceState::kFailed, error);
+        return false;
+    }
+
+    if (!MovePipeDescriptorsAboveStandardStreams(error_pipe)) {
+        const int error_number = errno;
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        error = std::string("failed to configure exec confirmation pipe descriptors: ") + std::strerror(error_number);
+
+        std::scoped_lock state_lock(state_mutex_);
+        TransitionStateLocked(ServiceState::kFailed, error);
+        return false;
+    }
+
+    if (!SetCloseOnExec(error_pipe[1])) {
+        const int error_number = errno;
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        error = std::string("failed to configure exec confirmation pipe: ") + std::strerror(error_number);
+
+        std::scoped_lock state_lock(state_mutex_);
+        TransitionStateLocked(ServiceState::kFailed, error);
+        return false;
+    }
 
     const pid_t child_pid = fork();
 
     if (child_pid < 0) {
-        error = std::string("fork failed: ") + std::strerror(errno);
+        const int error_number = errno;
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        error = std::string("fork failed: ") + std::strerror(error_number);
 
         std::scoped_lock state_lock(state_mutex_);
         TransitionStateLocked(ServiceState::kFailed, error);
@@ -203,17 +410,57 @@ bool ProcessSupervisor::StartOperation(std::string& error) {
     }
 
     if (child_pid == 0) {
-        if (chdir(work_dir.c_str()) != 0) {
-            std::cerr << "agent child: chdir failed: " << std::strerror(errno) << '\n';
-            _exit(127);
+        close(error_pipe[0]);
+
+        if (chdir(work_dir_data) != 0) {
+            ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kChangeDirectory, errno);
         }
 
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
+        const int null_device = open("/dev/null", O_WRONLY);
+        if (null_device < 0) {
+            ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kOpenNullDevice, errno);
+        }
 
-        execv(executable_path.c_str(), argv.data());
+        if (dup2(null_device, STDOUT_FILENO) < 0) {
+            ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kRedirectStandardOutput, errno);
+        }
 
-        _exit(127);
+        if (dup2(null_device, STDERR_FILENO) < 0) {
+            ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kRedirectStandardError, errno);
+        }
+
+        if (null_device != STDOUT_FILENO && null_device != STDERR_FILENO) {
+            close(null_device);
+        }
+
+        execv(executable_path_data, argv_data);
+        ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kExecute, errno);
+    }
+
+    close(error_pipe[1]);
+    fork_lock.unlock();
+
+    ChildStartError child_error{};
+    int pipe_error_number = 0;
+    const ExecConfirmationResult confirmation = WaitForExecConfirmation(error_pipe[0], child_error, pipe_error_number);
+    close(error_pipe[0]);
+
+    if (confirmation != ExecConfirmationResult::kSucceeded) {
+        if (confirmation == ExecConfirmationResult::kChildFailed) {
+            error = DescribeChildStartError(child_error, executable_path, work_dir);
+        } else if (confirmation == ExecConfirmationResult::kTimedOut) {
+            error = "timed out waiting for exec confirmation: " + definition_.id;
+            kill(child_pid, SIGKILL);
+        } else {
+            error = std::string("exec confirmation pipe failed: ") + std::strerror(pipe_error_number);
+            kill(child_pid, SIGKILL);
+        }
+
+        ReapChildBlocking(child_pid);
+
+        std::scoped_lock state_lock(state_mutex_);
+        TransitionStateLocked(ServiceState::kFailed, error);
+        return false;
     }
 
     {
