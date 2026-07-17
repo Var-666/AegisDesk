@@ -727,7 +727,7 @@ QString MainWindow::FormatSampleTime(const qint64 unix_time_milliseconds) {
         return "-";
     }
 
-    const QDateTime utc_time = QDateTime::fromMSecsSinceEpoch(unix_time_milliseconds, QTimeZone::UTC);
+    const QDateTime utc_time = QDateTime::fromMSecsSinceEpoch(unix_time_milliseconds, QTimeZone::utc());
 
     return utc_time.toLocalTime().toString("yyyy-MM-dd HH:mm:ss");
 }
