@@ -2,7 +2,7 @@
 // Created by Var on 2026/7/3.
 //
 
-#include "../include/agent/api/http_server.h"
+#include "agent/api/http_server.h"
 
 #include <boost/asio/error.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -12,6 +12,7 @@
 
 #include <iostream>
 #include <thread>
+#include <utility>
 
 namespace aegis::agent {
 
@@ -25,11 +26,17 @@ using tcp = asio::ip::tcp;
 
 } // namespace
 
-HttpServer::HttpServer(const HttpServerOptions& options, RequestHandler handler)
+HttpServer::HttpServer(HttpServerOptions options, RequestHandler handler)
     : options_(std::move(options))
     , handler_(std::move(handler)) {}
 
+unsigned short HttpServer::BoundPort() const noexcept {
+    return bound_port_.load(std::memory_order_acquire);
+}
+
 void HttpServer::Run(const std::function<bool()>& stop_requested) {
+    bound_port_.store(0, std::memory_order_release);
+
     beast::error_code error;
 
     const auto address = asio::ip::make_address(options_.bind_address, error);
@@ -59,10 +66,16 @@ void HttpServer::Run(const std::function<bool()>& stop_requested) {
         throw std::runtime_error("acceptor listen failed: " + error.message());
     }
 
+    const tcp::endpoint local_endpoint = acceptor.local_endpoint(error);
+    if (error) {
+        throw std::runtime_error("acceptor local_endpoint failed: " + error.message());
+    }
     acceptor.non_blocking(true, error);
     if (error) {
         throw std::runtime_error("acceptor non_blocking failed: " + error.message());
     }
+
+    bound_port_.store(local_endpoint.port(), std::memory_order_release);
 
     while (!stop_requested()) {
         tcp::socket socket(io_context_);
@@ -82,7 +95,7 @@ void HttpServer::Run(const std::function<bool()>& stop_requested) {
         HandleSession(std::move(socket));
     }
 }
-void HttpServer::HandleSession(boost::asio::ip::tcp::socket socket) {
+void HttpServer::HandleSession(boost::asio::ip::tcp::socket socket) const {
     beast::tcp_stream stream(std::move(socket));
 
     stream.expires_after(std::chrono::seconds(2));
