@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -13,6 +15,9 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -27,6 +32,11 @@ extern "C" void HandleSignal(int) {
 struct ServiceOptions {
     std::string service_name{"demo_service"};
     std::chrono::milliseconds heartbeat_interval{1000};
+    std::optional<std::chrono::seconds> exit_after;
+    int exit_code{0};
+    bool ignore_sigterm{false};
+    bool spawn_child{false};
+    unsigned int cpu_load_percent{0};
 };
 
 enum class ParseResultKind {
@@ -64,10 +74,18 @@ struct ParseResult {
 void PrintUsage() {
     std::cout << "Usage: demo_service "
               << "[--name SERVICE_NAME] "
-              << "[--interval-ms MILLISECONDS]\n\n"
+              << "[--interval-ms MILLISECONDS] "
+              << "[--exit-after SECONDS] "
+              << "[--exit-code CODE] "
+              << "[--ignore-sigterm] "
+              << "[--spawn-child] "
+              << "[--cpu-load-percent PERCENT]\n\n"
               << "Examples:\n"
               << "  demo_service\n"
-              << "  demo_service --name demo_worker --interval-ms 1500\n";
+              << "  demo_service --name demo_worker --interval-ms 1500\n"
+              << "  demo_service --exit-after 5 --exit-code 23\n"
+              << "  demo_service --ignore-sigterm --spawn-child\n"
+              << "  demo_service --cpu-load-percent 60\n";
 }
 
 ParseResult ParseArguments(const int argc, char* argv[]) {
@@ -75,6 +93,11 @@ ParseResult ParseArguments(const int argc, char* argv[]) {
 
     bool has_name = false;
     bool has_interval = false;
+    bool has_exit_after = false;
+    bool has_exit_code = false;
+    bool has_ignore_sigterm = false;
+    bool has_spawn_child = false;
+    bool has_cpu_load_percent = false;
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
@@ -152,6 +175,101 @@ ParseResult ParseArguments(const int argc, char* argv[]) {
             continue;
         }
 
+        if (argument == "--exit-after") {
+            if (has_exit_after) {
+                std::cerr << "--exit-after cannot be specified twice\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto value = read_value(argument);
+            unsigned long long parsed = 0;
+            constexpr unsigned long long kMaxExitAfterSeconds = 86400;
+
+            if (!value.has_value()) {
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
+            if (error != std::errc{} || end != value->data() + value->size() || parsed == 0
+                || parsed > kMaxExitAfterSeconds) {
+                std::cerr << "invalid --exit-after value: " << *value << "\nallowed range: 1 to "
+                          << kMaxExitAfterSeconds << " seconds\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            options.exit_after = std::chrono::seconds(parsed);
+            has_exit_after = true;
+            continue;
+        }
+
+        if (argument == "--exit-code") {
+            if (has_exit_code) {
+                std::cerr << "--exit-code cannot be specified twice\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto value = read_value(argument);
+            unsigned int parsed = 0;
+
+            if (!value.has_value()) {
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
+            if (error != std::errc{} || end != value->data() + value->size() || parsed > 255) {
+                std::cerr << "invalid --exit-code value: " << *value << "\nallowed range: 0 to 255\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            options.exit_code = static_cast<int>(parsed);
+            has_exit_code = true;
+            continue;
+        }
+
+        if (argument == "--ignore-sigterm") {
+            if (has_ignore_sigterm) {
+                std::cerr << "--ignore-sigterm cannot be specified twice\n";
+                return {.kind = ParseResultKind::kError};
+            }
+            options.ignore_sigterm = true;
+            has_ignore_sigterm = true;
+            continue;
+        }
+
+        if (argument == "--spawn-child") {
+            if (has_spawn_child) {
+                std::cerr << "--spawn-child cannot be specified twice\n";
+                return {.kind = ParseResultKind::kError};
+            }
+            options.spawn_child = true;
+            has_spawn_child = true;
+            continue;
+        }
+
+        if (argument == "--cpu-load-percent") {
+            if (has_cpu_load_percent) {
+                std::cerr << "--cpu-load-percent cannot be specified twice\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto value = read_value(argument);
+            unsigned int parsed = 0;
+
+            if (!value.has_value()) {
+                return {.kind = ParseResultKind::kError};
+            }
+
+            const auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), parsed);
+            if (error != std::errc{} || end != value->data() + value->size() || parsed > 100) {
+                std::cerr << "invalid --cpu-load-percent value: " << *value << "\nallowed range: 0 to 100\n";
+                return {.kind = ParseResultKind::kError};
+            }
+
+            options.cpu_load_percent = parsed;
+            has_cpu_load_percent = true;
+            continue;
+        }
+
         std::cerr << "unknown argument: " << argument << '\n';
         return {.kind = ParseResultKind::kError};
     }
@@ -218,6 +336,30 @@ void SleepInterruptibly(std::chrono::milliseconds duration) {
     }
 }
 
+void RunCpuLoadInterruptibly(std::chrono::milliseconds duration, const unsigned int cpu_load_percent) {
+    constexpr auto kCycle = 100ms;
+
+    while (g_running != 0 && duration > 0ms) {
+        const auto cycle = std::min(duration, kCycle);
+        const auto busy_duration = cycle * cpu_load_percent / 100;
+        const auto busy_until = std::chrono::steady_clock::now() + busy_duration;
+
+        while (g_running != 0 && std::chrono::steady_clock::now() < busy_until) {}
+
+        SleepInterruptibly(cycle - busy_duration);
+        duration -= cycle;
+    }
+}
+
+void StopAndReapChild(const pid_t child_pid, const bool child_ignores_sigterm) {
+    if (child_pid <= 0) {
+        return;
+    }
+
+    kill(child_pid, child_ignores_sigterm ? SIGKILL : SIGTERM);
+    while (waitpid(child_pid, nullptr, 0) < 0 && errno == EINTR) {}
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -257,9 +399,32 @@ int main(int argc, char* argv[]) {
     }
 
     std::signal(SIGINT, HandleSignal);
-    std::signal(SIGTERM, HandleSignal);
+    std::signal(SIGTERM, options.ignore_sigterm ? SIG_IGN : HandleSignal);
 
-    logger.Info("service started heartbeat_interval_ms=" + std::to_string(options.heartbeat_interval.count()));
+    pid_t child_pid = -1;
+    if (options.spawn_child) {
+        child_pid = fork();
+        if (child_pid < 0) {
+            logger.Warn("failed to spawn child: " + std::string(std::strerror(errno)));
+            return 2;
+        }
+        if (child_pid == 0) {
+            while (g_running != 0) {
+                std::this_thread::sleep_for(100ms);
+            }
+            _exit(0);
+        }
+        logger.Info("child spawned pid=" + std::to_string(child_pid));
+    }
+
+    logger.Info("service started heartbeat_interval_ms=" + std::to_string(options.heartbeat_interval.count())
+                + " cpu_load_percent=" + std::to_string(options.cpu_load_percent));
+
+    const auto started_at = std::chrono::steady_clock::now();
+    const std::optional<std::chrono::steady_clock::time_point> exit_at =
+        options.exit_after.has_value()
+            ? std::optional<std::chrono::steady_clock::time_point>(started_at + *options.exit_after)
+            : std::nullopt;
 
     int sequence = 0;
 
@@ -276,11 +441,27 @@ int main(int argc, char* argv[]) {
             logger.Warn("simulated slow request request_id=req-" + std::to_string(sequence) + " latency_ms=850");
         }
 
-        SleepInterruptibly(options.heartbeat_interval);
+        auto work_duration = options.heartbeat_interval;
+        if (exit_at.has_value()) {
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(*exit_at - std::chrono::steady_clock::now());
+            if (remaining <= 0ms) {
+                break;
+            }
+            work_duration = std::min(work_duration, remaining);
+        }
+
+        RunCpuLoadInterruptibly(work_duration, options.cpu_load_percent);
+
+        if (exit_at.has_value() && std::chrono::steady_clock::now() >= *exit_at) {
+            logger.Warn("fault injection exit-after reached exit_code=" + std::to_string(options.exit_code));
+            break;
+        }
     }
 
     logger.Info("service stopping");
+    StopAndReapChild(child_pid, options.ignore_sigterm);
     logger.Info("service stopped");
 
-    return 0;
+    return options.exit_code;
 }

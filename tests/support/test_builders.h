@@ -90,6 +90,11 @@ public:
         return *this;
     }
 
+    ServiceDefinitionBuilder& WithRecoveryPolicy(agent::RecoveryPolicy policy) {
+        definition_.recovery_policy = std::move(policy);
+        return *this;
+    }
+
     ServiceDefinitionBuilder& WithExecutable(std::filesystem::path executable) {
         definition_.executable = std::move(executable);
         return *this;
@@ -106,6 +111,10 @@ public:
 
     [[nodiscard]] static std::filesystem::path FaultProcessPath() {
         return std::filesystem::path(AEGIS_TEST_FAULT_PROCESS_PATH);
+    }
+
+    [[nodiscard]] static std::filesystem::path DemoServicePath() {
+        return std::filesystem::path(AEGIS_TEST_DEMO_SERVICE_PATH);
     }
 
 private:
