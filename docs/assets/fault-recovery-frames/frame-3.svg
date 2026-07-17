@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520">
+  <rect width="960" height="520" fill="#0b1220"/>
+  <text x="60" y="72" fill="#f8fafc" font-family="Arial, sans-serif" font-size="34" font-weight="700">AegisDesk Fault Recovery</text><text x="60" y="108" fill="#94a3b8" font-family="Arial, sans-serif" font-size="18">recovery policy applies budget and backoff</text>
+  <rect x="60" y="150" width="840" height="230" rx="18" fill="#111c30" stroke="#92400e" stroke-width="2"/>
+  <circle cx="115" cy="210" r="15" fill="#f59e0b"/><text x="150" y="221" fill="#e2e8f0" font-family="Arial, sans-serif" font-size="30" font-weight="700">Recovery Backoff</text>
+  <text x="90" y="282" fill="#94a3b8" font-family="Arial, sans-serif" font-size="20">Restart budget</text><text x="310" y="282" fill="#fde68a" font-family="Menlo, monospace" font-size="20">1 / 3 in 300s</text>
+  <text x="90" y="326" fill="#94a3b8" font-family="Arial, sans-serif" font-size="20">Next action</text><text x="310" y="326" fill="#fde68a" font-family="Menlo, monospace" font-size="20">restart after 1s</text>
+  <text x="60" y="438" fill="#64748b" font-family="Arial, sans-serif" font-size="17">RUNNING</text><text x="246" y="438" fill="#64748b" font-family="Arial, sans-serif" font-size="17">EXITED</text><text x="420" y="438" fill="#f59e0b" font-family="Arial, sans-serif" font-size="17">BACKOFF</text><text x="598" y="438" fill="#64748b" font-family="Arial, sans-serif" font-size="17">STARTING</text><text x="790" y="438" fill="#64748b" font-family="Arial, sans-serif" font-size="17">RECOVERED</text>
+  <rect x="60" y="458" width="125" height="8" rx="4" fill="#26354d"/><rect x="210" y="458" width="125" height="8" rx="4" fill="#26354d"/><rect x="375" y="458" width="125" height="8" rx="4" fill="#f59e0b"/><rect x="555" y="458" width="125" height="8" rx="4" fill="#26354d"/><rect x="765" y="458" width="135" height="8" rx="4" fill="#26354d"/>
+</svg>

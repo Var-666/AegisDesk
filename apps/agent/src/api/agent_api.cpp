@@ -145,6 +145,18 @@ void AppendStatusFields(std::ostringstream& body, const ServiceStatus& status) {
     } else {
         body << "null";
     }
+
+    body << ",\"process_group_id\":" << status.process_group_id << R"(,"last_exit_kind":")"
+         << ToString(status.last_exit_kind) << R"(","last_exit_signal":)";
+
+    if (status.last_exit_signal.has_value()) {
+        body << *status.last_exit_signal;
+    } else {
+        body << "null";
+    }
+
+    body << R"(,"last_error":")" << JsonEscape(status.last_error) << R"(","last_transition_at_unix_ms":)"
+         << status.last_transition_at_unix_ms;
 }
 
 void AppendOptionalDouble(std::ostringstream& body, const std::optional<double>& value) {

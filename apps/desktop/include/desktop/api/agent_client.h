@@ -33,9 +33,15 @@ struct ServiceSnapshot {
     bool auto_start{false};
 
     qint64 pid{-1};
+    qint64 process_group_id{-1};
     qint64 uptime_seconds{0};
+    qint64 last_transition_at_unix_ms{0};
 
     std::optional<int> last_exit_code;
+    std::optional<int> last_exit_signal;
+
+    QString last_exit_kind{"none"};
+    QString last_error;
 };
 
 struct ServiceMetricsSnapshot {

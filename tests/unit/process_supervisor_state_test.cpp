@@ -62,6 +62,18 @@ bool ProcessIsGone(const pid_t process_id) {
     return errno == ESRCH;
 }
 
+bool ProcessGroupIsGone(const pid_t process_group_id) {
+    if (process_group_id <= 0) {
+        return true;
+    }
+
+    if (kill(-process_group_id, 0) == 0) {
+        return false;
+    }
+
+    return errno == ESRCH;
+}
+
 } // namespace
 
 TEST(ProcessSupervisorStateTest, NewSupervisorStartsStopped) {
@@ -212,9 +224,10 @@ TEST(ProcessSupervisorObserverTest, ReapsNaturalExitWithoutStatusPolling) {
     const agent::ServiceStatus started = supervisor.GetStatus();
     ASSERT_GT(started.pid, 0);
 
-    // Do not call GetStatus while the process exits. The observer must perform
-    // waitpid independently rather than relying on status polling to reap it.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Do not call GetStatus while the process exits. Wait for the PID to
+    // disappear instead: the observer must perform waitpid independently
+    // rather than relying on status polling to reap it.
+    ASSERT_TRUE(WaitUntil([&] { return ProcessIsGone(started.pid); }));
 
     errno = 0;
     EXPECT_EQ(waitpid(started.pid, nullptr, WNOHANG), -1);
@@ -531,6 +544,41 @@ TEST(ProcessSupervisorConcurrencyTest, RestartKeepsDesiredStateRunningWhileStopp
 
     std::string stop_error;
     EXPECT_TRUE(supervisor.Stop(stop_error)) << stop_error;
+}
+
+TEST(ProcessSupervisorStressTest, CompletesOneHundredStartRestartStopCyclesWithoutResidualProcesses) {
+    ScopedTempDirectory directory("supervisor-100-cycles");
+    agent::ProcessSupervisor supervisor(ServiceDefinitionBuilder(directory.Path()).Build());
+
+    for (int cycle = 1; cycle <= 100; ++cycle) {
+        std::string error;
+        ASSERT_TRUE(supervisor.Start(error)) << "cycle " << cycle << ": " << error;
+
+        const agent::ServiceStatus first_run = supervisor.GetStatus();
+        ASSERT_GT(first_run.pid, 0) << "cycle " << cycle;
+        ASSERT_GT(first_run.process_group_id, 0) << "cycle " << cycle;
+
+        ASSERT_TRUE(supervisor.Restart(error)) << "cycle " << cycle << ": " << error;
+        EXPECT_TRUE(ProcessIsGone(first_run.pid)) << "cycle " << cycle << ", stale leader " << first_run.pid;
+        EXPECT_TRUE(ProcessGroupIsGone(first_run.process_group_id))
+            << "cycle " << cycle << ", stale process group " << first_run.process_group_id;
+
+        const agent::ServiceStatus second_run = supervisor.GetStatus();
+        ASSERT_EQ(second_run.state, agent::ServiceState::kRunning) << "cycle " << cycle;
+        ASSERT_GT(second_run.pid, 0) << "cycle " << cycle;
+        ASSERT_GT(second_run.process_group_id, 0) << "cycle " << cycle;
+
+        ASSERT_TRUE(supervisor.Stop(error)) << "cycle " << cycle << ": " << error;
+        EXPECT_TRUE(ProcessIsGone(second_run.pid)) << "cycle " << cycle << ", stale leader " << second_run.pid;
+        EXPECT_TRUE(ProcessGroupIsGone(second_run.process_group_id))
+            << "cycle " << cycle << ", stale process group " << second_run.process_group_id;
+
+        const agent::ServiceStatus stopped = supervisor.GetStatus();
+        EXPECT_EQ(stopped.state, agent::ServiceState::kStopped) << "cycle " << cycle;
+        EXPECT_EQ(stopped.desired_state, agent::DesiredState::kStopped) << "cycle " << cycle;
+        EXPECT_EQ(stopped.pid, -1) << "cycle " << cycle;
+        EXPECT_EQ(stopped.process_group_id, -1) << "cycle " << cycle;
+    }
 }
 
 } // namespace aegis::test

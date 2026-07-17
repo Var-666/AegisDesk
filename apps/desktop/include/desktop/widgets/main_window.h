@@ -80,9 +80,13 @@ private:
     QLabel* state_value_{nullptr};
     QLabel* desired_state_value_{nullptr};
     QLabel* pid_value_{nullptr};
+    QLabel* process_group_value_{nullptr};
     QLabel* uptime_value_{nullptr};
     QLabel* auto_start_value_{nullptr};
     QLabel* last_exit_value_{nullptr};
+    QLabel* exit_reason_value_{nullptr};
+    QLabel* last_error_value_{nullptr};
+    QLabel* transition_time_value_{nullptr};
 
     QLabel* metrics_status_value_{nullptr};
     QLabel* cpu_value_{nullptr};

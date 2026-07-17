@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+        build_type: [Debug, Release]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libboost-all-dev qt6-base-dev libqt6charts6-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install boost qt
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix qt)" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: Linux / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: ASan + UBSan
+            cmake_flags: -DAEGIS_ENABLE_ASAN=ON -DAEGIS_ENABLE_UBSAN=ON
+            runtime_options: ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+          - sanitizer: TSan
+            cmake_flags: -DAEGIS_ENABLE_TSAN=ON
+            runtime_options: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libboost-all-dev qt6-base-dev libqt6charts6-dev
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTING=ON
+          ${{ matrix.cmake_flags }}
+
+      - name: Build core tests
+        run: cmake --build build --target aegis_agent_core_tests --parallel 4
+
+      - name: Run sanitizer tests
+        run: ${{ matrix.runtime_options }} ctest --test-dir build --output-on-failure

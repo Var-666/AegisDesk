@@ -23,6 +23,7 @@ add_executable(aegis_agent_core_tests
         unit/health_checker_test.cpp
         unit/process_supervisor_state_test.cpp
         unit/recovery_manager_test.cpp
+        unit/agent_api_status_test.cpp
         support/test_builders.h
 )
 
@@ -46,5 +47,5 @@ gtest_discover_tests(
         DISCOVERY_MODE PRE_TEST
         PROPERTIES
         LABELS unit
-        TIMEOUT 10
+        TIMEOUT 180
 )

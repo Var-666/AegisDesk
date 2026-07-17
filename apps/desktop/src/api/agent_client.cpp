@@ -114,6 +114,23 @@ bool ParseOptionalInt64(const QJsonValue& value, qint64 minimum, std::optional<q
     return true;
 }
 
+bool ParseOptionalInt(const QJsonValue& value, std::optional<int>& result) {
+    if (value.isUndefined() || value.isNull()) {
+        result.reset();
+        return true;
+    }
+
+    qint64 parsed = 0;
+
+    if (!ParseRequiredInt64(value, std::numeric_limits<int>::min(), parsed)
+        || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    result = static_cast<int>(parsed);
+    return true;
+}
+
 bool ParseOptionalString(const QJsonValue& value, std::optional<QString>& result) {
     if (value.isNull()) {
         result.reset();
@@ -587,10 +604,6 @@ std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObje
         return std::nullopt;
     }
 
-    if (!exit_code_value.isNull() && !exit_code_value.isDouble()) {
-        return std::nullopt;
-    }
-
     ServiceSnapshot snapshot;
 
     snapshot.id = id_value.toString();
@@ -598,11 +611,46 @@ std::optional<ServiceSnapshot> AgentClient::ParseServiceSnapshot(const QJsonObje
     snapshot.state = state_value.toString();
     snapshot.desired_state = desired_state_value.toString();
     snapshot.auto_start = auto_start_value.toBool();
-    snapshot.pid = static_cast<qint64>(pid_value.toDouble());
-    snapshot.uptime_seconds = static_cast<qint64>(uptime_value.toDouble());
+    if (!ParseRequiredInt64(pid_value, -1, snapshot.pid)
+        || !ParseRequiredInt64(uptime_value, 0, snapshot.uptime_seconds)
+        || !ParseOptionalInt(exit_code_value, snapshot.last_exit_code)) {
+        return std::nullopt;
+    }
 
-    if (exit_code_value.isDouble()) {
-        snapshot.last_exit_code = static_cast<int>(exit_code_value.toDouble());
+    // The lifecycle fields were added in Process Supervisor 2.0. Treat them as
+    // optional so this Desktop can still inspect an older Agent response.
+    const QJsonValue process_group_value = object.value("process_group_id");
+    const QJsonValue exit_kind_value = object.value("last_exit_kind");
+    const QJsonValue exit_signal_value = object.value("last_exit_signal");
+    const QJsonValue last_error_value = object.value("last_error");
+    const QJsonValue transition_value = object.value("last_transition_at_unix_ms");
+
+    if (!process_group_value.isUndefined()
+        && !ParseRequiredInt64(process_group_value, -1, snapshot.process_group_id)) {
+        return std::nullopt;
+    }
+
+    if (!exit_kind_value.isUndefined()) {
+        if (!exit_kind_value.isString()) {
+            return std::nullopt;
+        }
+        snapshot.last_exit_kind = exit_kind_value.toString();
+    }
+
+    if (!ParseOptionalInt(exit_signal_value, snapshot.last_exit_signal)) {
+        return std::nullopt;
+    }
+
+    if (!last_error_value.isUndefined()) {
+        if (!last_error_value.isString()) {
+            return std::nullopt;
+        }
+        snapshot.last_error = last_error_value.toString();
+    }
+
+    if (!transition_value.isUndefined()
+        && !ParseRequiredInt64(transition_value, 0, snapshot.last_transition_at_unix_ms)) {
+        return std::nullopt;
     }
 
     return snapshot;

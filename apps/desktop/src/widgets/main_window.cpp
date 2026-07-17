@@ -40,6 +40,22 @@ QString ServiceListText(const ServiceSnapshot& service) {
         .arg(service.display_name, service.id, service.state, service.desired_state);
 }
 
+QString FormatExitReason(const ServiceSnapshot& snapshot) {
+    const QString kind = snapshot.last_exit_kind.trimmed().toLower();
+
+    if (kind == "exited") {
+        return snapshot.last_exit_code.has_value() ? QString("exited (code %1)").arg(*snapshot.last_exit_code)
+                                                   : QString("exited");
+    }
+
+    if (kind == "signaled") {
+        return snapshot.last_exit_signal.has_value() ? QString("signaled (signal %1)").arg(*snapshot.last_exit_signal)
+                                                     : QString("signaled");
+    }
+
+    return kind == "none" || kind.isEmpty() ? QString("-") : snapshot.last_exit_kind;
+}
+
 void SetLabelsText(std::initializer_list<QLabel*> labels, const QString& text) {
     for (QLabel* label : labels) {
         label->setText(text);
@@ -152,11 +168,15 @@ QGroupBox* MainWindow::BuildServiceDetailsGroup(QWidget* parent) {
     ui::AddValueRow(service_layout, 0, 0, "Display Name:", service_name_value_, details_group_);
     ui::AddValueRow(service_layout, 0, 2, "Service ID:", service_id_value_, details_group_);
     ui::AddValueRow(service_layout, 1, 0, "State:", state_value_, details_group_);
-    ui::AddValueRow(service_layout, 1, 2, "PID:", pid_value_, details_group_);
-    ui::AddValueRow(service_layout, 2, 0, "Uptime:", uptime_value_, details_group_);
-    ui::AddValueRow(service_layout, 2, 2, "Auto Start:", auto_start_value_, details_group_);
-    ui::AddValueRow(service_layout, 3, 0, "Last Exit:", last_exit_value_, details_group_);
-    ui::AddValueRow(service_layout, 3, 2, "Desired:", desired_state_value_, details_group_);
+    ui::AddValueRow(service_layout, 1, 2, "Desired:", desired_state_value_, details_group_);
+    ui::AddValueRow(service_layout, 2, 0, "PID:", pid_value_, details_group_);
+    ui::AddValueRow(service_layout, 2, 2, "Process Group:", process_group_value_, details_group_);
+    ui::AddValueRow(service_layout, 3, 0, "Uptime:", uptime_value_, details_group_);
+    ui::AddValueRow(service_layout, 3, 2, "Auto Start:", auto_start_value_, details_group_);
+    ui::AddValueRow(service_layout, 4, 0, "Last Exit Code:", last_exit_value_, details_group_);
+    ui::AddValueRow(service_layout, 4, 2, "Exit Reason:", exit_reason_value_, details_group_);
+    ui::AddValueRow(service_layout, 5, 0, "Last Error:", last_error_value_, details_group_);
+    ui::AddValueRow(service_layout, 5, 2, "Transitioned:", transition_time_value_, details_group_);
 
     // 控制按钮区域
     auto* actions_layout = new QHBoxLayout();
@@ -170,7 +190,7 @@ QGroupBox* MainWindow::BuildServiceDetailsGroup(QWidget* parent) {
     actions_layout->addWidget(restart_button_);
     actions_layout->addStretch();
 
-    service_layout->addLayout(actions_layout, 4, 0, 1, 4);
+    service_layout->addLayout(actions_layout, 6, 0, 1, 4);
 
     return details_group_;
 }
@@ -546,7 +566,8 @@ void MainWindow::ApplySnapshot(const ServiceSnapshot& snapshot) {
     service_id_value_->setText(snapshot.id);
     state_value_->setText(snapshot.state);
     desired_state_value_->setText(snapshot.desired_state);
-    pid_value_->setText(QString::number(snapshot.pid));
+    pid_value_->setText(snapshot.pid > 0 ? QString::number(snapshot.pid) : "-");
+    process_group_value_->setText(snapshot.process_group_id > 0 ? QString::number(snapshot.process_group_id) : "-");
 
     uptime_value_->setText(FormatUptime(snapshot.uptime_seconds));
 
@@ -557,6 +578,11 @@ void MainWindow::ApplySnapshot(const ServiceSnapshot& snapshot) {
     } else {
         last_exit_value_->setText("-");
     }
+
+    exit_reason_value_->setText(FormatExitReason(snapshot));
+    last_error_value_->setText(snapshot.last_error.isEmpty() ? "-" : snapshot.last_error);
+    last_error_value_->setToolTip(snapshot.last_error);
+    transition_time_value_->setText(FormatSampleTime(snapshot.last_transition_at_unix_ms));
 
     UpdateActionButtons();
 }
@@ -597,8 +623,11 @@ void MainWindow::ClearCurrentServiceDetails() {
     details_group_->setTitle("Service Details");
 
     SetLabelsText({service_name_value_, service_id_value_, state_value_, desired_state_value_, pid_value_,
-                   uptime_value_, auto_start_value_, last_exit_value_},
+                   process_group_value_, uptime_value_, auto_start_value_, last_exit_value_, exit_reason_value_,
+                   last_error_value_, transition_time_value_},
                   "-");
+
+    last_error_value_->setToolTip({});
 
     log_view_->clear();
 
@@ -628,8 +657,10 @@ void MainWindow::ShowMetricsNotReady() {
 
 void MainWindow::UpdateActionButtons() const {
     const bool service_running = current_state_ == "running";
+    const bool service_transitioning = current_state_ == "starting" || current_state_ == "stopping";
 
-    const bool can_control = has_snapshot_ && !current_service_id_.isEmpty() && !action_in_flight_;
+    const bool can_control =
+        has_snapshot_ && !current_service_id_.isEmpty() && !action_in_flight_ && !service_transitioning;
 
     start_button_->setEnabled(can_control && !service_running);
 
