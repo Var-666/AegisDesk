@@ -73,13 +73,21 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(aegis_agent_core PRIVATE -Wall -Wextra -Wpedantic)
 endif ()
 
-add_executable(agent
-        main.cpp
+add_library(aegis_agent_http STATIC
         src/api/http_server.cpp
         include/agent/api/http_server.h
 )
 
-target_link_libraries(agent PRIVATE aegis_agent_core)
+target_include_directories(aegis_agent_http PUBLIC include)
+target_link_libraries(aegis_agent_http PUBLIC aegis_agent_core)
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(aegis_agent_http PRIVATE -Wall -Wextra -Wpedantic)
+endif ()
+
+add_executable(agent main.cpp)
+
+target_link_libraries(agent PRIVATE aegis_agent_http)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agent PRIVATE -Wall -Wextra -Wpedantic)

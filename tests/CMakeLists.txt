@@ -49,3 +49,21 @@ gtest_discover_tests(
         LABELS unit
         TIMEOUT 180
 )
+
+add_executable(aegis_http_server_tests
+        integration/http_server_baseline_test.cpp
+)
+
+target_link_libraries(aegis_http_server_tests PRIVATE aegis_agent_http GTest::gtest_main)
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(aegis_http_server_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif ()
+
+gtest_discover_tests(
+        aegis_http_server_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES
+        LABELS baseline
+        TIMEOUT 180
+)
