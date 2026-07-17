@@ -5,10 +5,12 @@
 #include "agent/service/service_definition.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include <sys/types.h>
 
@@ -58,7 +60,7 @@ public:
     bool Stop(std::string& error);
     bool Restart(std::string& error);
 
-    [[nodiscard]] ServiceStatus GetStatus();
+    [[nodiscard]] ServiceStatus GetStatus() const;
 
     [[nodiscard]] const ServiceDefinition& Definition() const noexcept;
 
@@ -69,9 +71,10 @@ public:
 private:
     bool StartOperation(std::string& error);
     bool StopOperation(std::string& error, DesiredState final_desired_state);
-    bool WaitForExit(pid_t target_pid, std::chrono::steady_clock::time_point deadline);
+    bool WaitForObservedExit(pid_t target_pid, std::chrono::steady_clock::time_point deadline);
 
-    bool ReapExitedChildLocked();
+    void ObserveChildExit(pid_t target_pid) noexcept;
+    void JoinObserverThread() noexcept;
     void SaveExitStatusLocked(int status);
     void MarkChildExitedLocked();
     void TransitionStateLocked(ServiceState state, std::string error = {});
@@ -84,6 +87,8 @@ private:
 
     std::mutex operation_mutex_;
     mutable std::mutex state_mutex_;
+    std::condition_variable exit_condition_;
+    std::thread observer_thread_;
 
     ServiceState state_{ServiceState::kStopped};
     pid_t pid_{-1};

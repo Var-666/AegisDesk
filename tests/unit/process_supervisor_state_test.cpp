@@ -8,6 +8,7 @@
 #include <barrier>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 namespace aegis::test {
 namespace {
@@ -171,6 +173,76 @@ TEST(ProcessSupervisorStateTest, NaturalExitTransitionsToExitedAndPreservesDesir
     EXPECT_EQ(*final_status.exit_code, 23);
     EXPECT_FALSE(final_status.last_exit_signal.has_value());
     EXPECT_TRUE(final_status.last_error.empty());
+}
+
+TEST(ProcessSupervisorObserverTest, ReapsNaturalExitWithoutStatusPolling) {
+    ScopedTempDirectory directory("supervisor-observed-reap");
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path()).WithArgs({"--exit-after-ms", "100", "--exit-code", "7"}).Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    const agent::ServiceStatus started = supervisor.GetStatus();
+    ASSERT_GT(started.pid, 0);
+
+    // Do not call GetStatus while the process exits. The observer must perform
+    // waitpid independently rather than relying on status polling to reap it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    errno = 0;
+    EXPECT_EQ(waitpid(started.pid, nullptr, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
+
+    const agent::ServiceStatus exited = supervisor.GetStatus();
+    EXPECT_EQ(exited.state, agent::ServiceState::kExited);
+    EXPECT_EQ(exited.pid, -1);
+    EXPECT_EQ(exited.last_exit_kind, agent::ProcessExitKind::kExited);
+    ASSERT_TRUE(exited.exit_code.has_value());
+    EXPECT_EQ(*exited.exit_code, 7);
+}
+
+TEST(ProcessSupervisorObserverTest, RecordsSignalExit) {
+    ScopedTempDirectory directory("supervisor-signal-exit");
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path()).WithExecutable("/bin/sh").WithArgs({"-c", "kill -TERM $$"}).Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+
+    agent::ServiceStatus exited;
+    ASSERT_TRUE(WaitUntil([&] {
+        exited = supervisor.GetStatus();
+        return exited.state == agent::ServiceState::kExited;
+    }));
+
+    EXPECT_EQ(exited.desired_state, agent::DesiredState::kRunning);
+    EXPECT_EQ(exited.last_exit_kind, agent::ProcessExitKind::kSignaled);
+    ASSERT_TRUE(exited.last_exit_signal.has_value());
+    EXPECT_EQ(*exited.last_exit_signal, SIGTERM);
+    ASSERT_TRUE(exited.exit_code.has_value());
+    EXPECT_EQ(*exited.exit_code, 128 + SIGTERM);
+}
+
+TEST(ProcessSupervisorObserverTest, CanStartAgainAfterObservedNaturalExit) {
+    ScopedTempDirectory directory("supervisor-observer-reuse");
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path()).WithArgs({"--exit-after-ms", "30"}).Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    ASSERT_TRUE(WaitUntil([&] { return supervisor.GetStatus().state == agent::ServiceState::kExited; }));
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    ASSERT_TRUE(WaitUntil([&] { return supervisor.GetStatus().state == agent::ServiceState::kExited; }));
+
+    const agent::ServiceStatus final_status = supervisor.GetStatus();
+    EXPECT_EQ(final_status.pid, -1);
+    EXPECT_EQ(final_status.last_exit_kind, agent::ProcessExitKind::kExited);
+    ASSERT_TRUE(final_status.exit_code.has_value());
+    EXPECT_EQ(*final_status.exit_code, 0);
 }
 
 TEST(ProcessSupervisorStateTest, StateAndExitKindsHaveStableStrings) {
