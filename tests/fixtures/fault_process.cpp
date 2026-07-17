@@ -27,10 +27,10 @@ struct Options {
     std::optional<std::filesystem::path> ready_file;
     bool ignore_sigterm{false};
     bool spawn_child{false};
+    bool leave_child_running{false};
 };
 
-template <typename Integer>
-bool ParseInteger(const std::string_view text, Integer& value) {
+template <typename Integer> bool ParseInteger(const std::string_view text, Integer& value) {
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     return error == std::errc{} && end == text.data() + text.size();
 }
@@ -71,9 +71,15 @@ std::optional<Options> ParseOptions(const int argc, char* argv[]) {
             options.ignore_sigterm = true;
         } else if (argument == "--spawn-child") {
             options.spawn_child = true;
+        } else if (argument == "--leave-child-running") {
+            options.leave_child_running = true;
         } else {
             return std::nullopt;
         }
+    }
+
+    if (options.leave_child_running && !options.spawn_child) {
+        return std::nullopt;
     }
 
     return options;
@@ -124,14 +130,16 @@ int main(int argc, char* argv[]) {
             return 4;
         }
         ready << ::getpid() << '\n';
+        if (child_pid > 0) {
+            ready << child_pid << '\n';
+        }
     }
 
     RunLoop(options->exit_after);
 
-    if (child_pid > 0) {
+    if (child_pid > 0 && !options->leave_child_running) {
         kill(child_pid, SIGTERM);
-        while (waitpid(child_pid, nullptr, 0) < 0 && errno == EINTR) {
-        }
+        while (waitpid(child_pid, nullptr, 0) < 0 && errno == EINTR) {}
     }
 
     return options->exit_code;

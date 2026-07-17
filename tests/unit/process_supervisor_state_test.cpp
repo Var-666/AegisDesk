@@ -38,6 +38,30 @@ bool WaitUntil(Predicate predicate, const std::chrono::milliseconds timeout = st
     return predicate();
 }
 
+std::vector<pid_t> ReadProcessIds(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    std::vector<pid_t> process_ids;
+    pid_t process_id = -1;
+
+    while (input >> process_id) {
+        process_ids.push_back(process_id);
+    }
+
+    return process_ids;
+}
+
+bool ProcessIsGone(const pid_t process_id) {
+    if (process_id <= 0) {
+        return true;
+    }
+
+    if (kill(process_id, 0) == 0) {
+        return false;
+    }
+
+    return errno == ESRCH;
+}
+
 } // namespace
 
 TEST(ProcessSupervisorStateTest, NewSupervisorStartsStopped) {
@@ -137,6 +161,7 @@ TEST(ProcessSupervisorStateTest, StartAndStopFollowRunningLifecycle) {
     EXPECT_EQ(running.state, agent::ServiceState::kRunning);
     EXPECT_EQ(running.desired_state, agent::DesiredState::kRunning);
     EXPECT_GT(running.pid, 0);
+    EXPECT_EQ(running.process_group_id, running.pid);
     EXPECT_TRUE(running.last_error.empty());
 
     ASSERT_TRUE(supervisor.Stop(error)) << error;
@@ -145,6 +170,7 @@ TEST(ProcessSupervisorStateTest, StartAndStopFollowRunningLifecycle) {
     EXPECT_EQ(stopped.state, agent::ServiceState::kStopped);
     EXPECT_EQ(stopped.desired_state, agent::DesiredState::kStopped);
     EXPECT_EQ(stopped.pid, -1);
+    EXPECT_EQ(stopped.process_group_id, -1);
     EXPECT_EQ(stopped.last_exit_kind, agent::ProcessExitKind::kExited);
     ASSERT_TRUE(stopped.exit_code.has_value());
     EXPECT_EQ(*stopped.exit_code, 0);
@@ -243,6 +269,105 @@ TEST(ProcessSupervisorObserverTest, CanStartAgainAfterObservedNaturalExit) {
     EXPECT_EQ(final_status.last_exit_kind, agent::ProcessExitKind::kExited);
     ASSERT_TRUE(final_status.exit_code.has_value());
     EXPECT_EQ(*final_status.exit_code, 0);
+}
+
+TEST(ProcessSupervisorProcessGroupTest, StopTerminatesLeaderAndChild) {
+    ScopedTempDirectory directory("supervisor-process-group-stop");
+    const std::filesystem::path ready_file = directory.Path() / "ready";
+    const agent::ServiceDefinition definition = ServiceDefinitionBuilder(directory.Path())
+                                                    .WithArgs({"--ready-file", ready_file.string(), "--spawn-child"})
+                                                    .Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    ASSERT_TRUE(WaitUntil([&] { return ReadProcessIds(ready_file).size() == 2; }));
+    const std::vector<pid_t> process_ids = ReadProcessIds(ready_file);
+    ASSERT_EQ(process_ids.size(), 2U);
+
+    const agent::ServiceStatus running = supervisor.GetStatus();
+    EXPECT_EQ(running.pid, process_ids[0]);
+    EXPECT_EQ(running.process_group_id, process_ids[0]);
+    EXPECT_EQ(getpgid(process_ids[0]), process_ids[0]);
+    EXPECT_EQ(getpgid(process_ids[1]), process_ids[0]);
+
+    ASSERT_TRUE(supervisor.Stop(error)) << error;
+    EXPECT_TRUE(WaitUntil([&] { return ProcessIsGone(process_ids[0]) && ProcessIsGone(process_ids[1]); }));
+
+    const agent::ServiceStatus stopped = supervisor.GetStatus();
+    EXPECT_EQ(stopped.state, agent::ServiceState::kStopped);
+    EXPECT_EQ(stopped.pid, -1);
+    EXPECT_EQ(stopped.process_group_id, -1);
+}
+
+TEST(ProcessSupervisorProcessGroupTest, ObserverCleansChildLeftBehindByExitedLeader) {
+    ScopedTempDirectory directory("supervisor-process-group-orphan");
+    const std::filesystem::path ready_file = directory.Path() / "ready";
+    const agent::ServiceDefinition definition = ServiceDefinitionBuilder(directory.Path())
+                                                    .WithArgs({"--ready-file", ready_file.string(), "--spawn-child",
+                                                               "--leave-child-running", "--exit-after-ms", "50"})
+                                                    .Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    ASSERT_TRUE(WaitUntil([&] { return ReadProcessIds(ready_file).size() == 2; }));
+    const std::vector<pid_t> process_ids = ReadProcessIds(ready_file);
+    ASSERT_EQ(process_ids.size(), 2U);
+
+    ASSERT_TRUE(WaitUntil([&] {
+        const agent::ServiceStatus status = supervisor.GetStatus();
+        return status.state == agent::ServiceState::kExited && status.process_group_id == -1;
+    }));
+    EXPECT_TRUE(WaitUntil([&] { return ProcessIsGone(process_ids[0]) && ProcessIsGone(process_ids[1]); }));
+}
+
+TEST(ProcessSupervisorProcessGroupTest, StopEscalatesToSigkillForIgnoringProcessGroup) {
+    ScopedTempDirectory directory("supervisor-process-group-sigkill");
+    const std::filesystem::path ready_file = directory.Path() / "ready";
+    const agent::ServiceDefinition definition =
+        ServiceDefinitionBuilder(directory.Path())
+            .WithArgs({"--ready-file", ready_file.string(), "--spawn-child", "--ignore-sigterm"})
+            .Build();
+    agent::ProcessSupervisor supervisor(definition);
+    std::string error;
+
+    ASSERT_TRUE(supervisor.Start(error)) << error;
+    ASSERT_TRUE(WaitUntil([&] { return ReadProcessIds(ready_file).size() == 2; }));
+    const std::vector<pid_t> process_ids = ReadProcessIds(ready_file);
+    ASSERT_EQ(process_ids.size(), 2U);
+
+    ASSERT_TRUE(supervisor.Stop(error)) << error;
+    EXPECT_TRUE(WaitUntil([&] { return ProcessIsGone(process_ids[0]) && ProcessIsGone(process_ids[1]); }));
+
+    const agent::ServiceStatus stopped = supervisor.GetStatus();
+    EXPECT_EQ(stopped.state, agent::ServiceState::kStopped);
+    EXPECT_EQ(stopped.last_exit_kind, agent::ProcessExitKind::kSignaled);
+    ASSERT_TRUE(stopped.last_exit_signal.has_value());
+    EXPECT_EQ(*stopped.last_exit_signal, SIGKILL);
+    EXPECT_EQ(stopped.process_group_id, -1);
+}
+
+TEST(ProcessSupervisorProcessGroupTest, DestructorStopsEntireProcessGroup) {
+    ScopedTempDirectory directory("supervisor-process-group-destructor");
+    const std::filesystem::path ready_file = directory.Path() / "ready";
+    std::vector<pid_t> process_ids;
+
+    {
+        const agent::ServiceDefinition definition =
+            ServiceDefinitionBuilder(directory.Path())
+                .WithArgs({"--ready-file", ready_file.string(), "--spawn-child"})
+                .Build();
+        agent::ProcessSupervisor supervisor(definition);
+        std::string error;
+
+        ASSERT_TRUE(supervisor.Start(error)) << error;
+        ASSERT_TRUE(WaitUntil([&] { return ReadProcessIds(ready_file).size() == 2; }));
+        process_ids = ReadProcessIds(ready_file);
+        ASSERT_EQ(process_ids.size(), 2U);
+    }
+
+    EXPECT_TRUE(WaitUntil([&] { return ProcessIsGone(process_ids[0]) && ProcessIsGone(process_ids[1]); }));
 }
 
 TEST(ProcessSupervisorStateTest, StateAndExitKindsHaveStableStrings) {

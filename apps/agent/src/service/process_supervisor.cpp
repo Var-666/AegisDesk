@@ -1,5 +1,6 @@
 #include "agent/service/process_supervisor.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -19,18 +20,49 @@ namespace {
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(3);
 constexpr auto kForcedStopTimeout = std::chrono::seconds(3);
 constexpr auto kExecConfirmationTimeout = std::chrono::seconds(5);
+constexpr auto kProcessGroupPollInterval = std::chrono::milliseconds(25);
 
-// Serializing pipe setup and fork prevents one concurrently-starting child
-// from inheriting another service's exec-confirmation writer.
 std::mutex g_fork_mutex;
 
 enum class ChildStartStage : int {
-    kChangeDirectory = 1,
+    kCreateProcessGroup = 1,
+    kChangeDirectory,
     kOpenNullDevice,
     kRedirectStandardOutput,
     kRedirectStandardError,
     kExecute,
 };
+
+bool ProcessGroupExists(const pid_t process_group_id) {
+    if (process_group_id <= 0) {
+        return false;
+    }
+
+    if (kill(-process_group_id, 0) == 0) {
+        return true;
+    }
+
+    return errno == EPERM;
+}
+
+int SignalProcessTree(const pid_t process_group_id, const pid_t leader_pid, const int signal) {
+    if (process_group_id > 0) {
+        return kill(-process_group_id, signal);
+    }
+
+    return leader_pid > 0 ? kill(leader_pid, signal) : 0;
+}
+
+bool WaitForProcessGroupExit(const pid_t process_group_id, const std::chrono::steady_clock::time_point deadline) {
+    while (ProcessGroupExists(process_group_id)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(kProcessGroupPollInterval);
+    }
+
+    return true;
+}
 
 struct ChildStartError {
     ChildStartStage stage;
@@ -166,6 +198,9 @@ std::string DescribeChildStartError(const ChildStartError& child_error, const st
     std::string operation;
 
     switch (child_error.stage) {
+        case ChildStartStage::kCreateProcessGroup:
+            operation = "setpgid(0, 0)";
+            break;
         case ChildStartStage::kChangeDirectory:
             operation = "chdir('" + work_dir + "')";
             break;
@@ -237,13 +272,15 @@ ProcessSupervisor::~ProcessSupervisor() noexcept {
         std::cerr << "[agent] destructor stop failed: " << error << '\n';
 
         pid_t target_pid = -1;
+        pid_t target_process_group_id = -1;
         {
             std::scoped_lock state_lock(state_mutex_);
             target_pid = pid_;
+            target_process_group_id = process_group_id_;
         }
 
-        if (target_pid > 0) {
-            kill(target_pid, SIGKILL);
+        if (target_pid > 0 || target_process_group_id > 0) {
+            SignalProcessTree(target_process_group_id, target_pid, SIGKILL);
         }
     }
 
@@ -278,6 +315,7 @@ ServiceStatus ProcessSupervisor::GetStatus() const {
     status.state = state_;
     status.desired_state = desired_state_;
     status.pid = pid_;
+    status.process_group_id = process_group_id_;
     status.exit_code = last_exit_code_;
     status.last_exit_kind = last_exit_kind_;
     status.last_exit_signal = last_exit_signal_;
@@ -315,11 +353,18 @@ bool ProcessSupervisor::StartOperation(std::string& error) {
             error = definition_.id + " is already running";
             return false;
         }
-
-        TransitionStateLocked(ServiceState::kStarting);
     }
 
     JoinObserverThread();
+
+    {
+        std::scoped_lock state_lock(state_mutex_);
+        if (process_group_id_ > 0) {
+            error = definition_.id + " still has an active process group";
+            return false;
+        }
+        TransitionStateLocked(ServiceState::kStarting);
+    }
 
     if (!definition_.IsStructurallyValid()) {
         error = "invalid service definition: " + definition_.id;
@@ -418,6 +463,10 @@ bool ProcessSupervisor::StartOperation(std::string& error) {
     if (child_pid == 0) {
         close(error_pipe[0]);
 
+        if (setpgid(0, 0) != 0) {
+            ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kCreateProcessGroup, errno);
+        }
+
         if (chdir(work_dir_data) != 0) {
             ReportChildStartErrorAndExit(error_pipe[1], ChildStartStage::kChangeDirectory, errno);
         }
@@ -472,19 +521,21 @@ bool ProcessSupervisor::StartOperation(std::string& error) {
     {
         std::scoped_lock state_lock(state_mutex_);
         pid_ = child_pid;
+        process_group_id_ = child_pid;
         start_time_ = std::chrono::steady_clock::now();
     }
 
     try {
-        observer_thread_ = std::thread(&ProcessSupervisor::ObserveChildExit, this, child_pid);
+        observer_thread_ = std::thread(&ProcessSupervisor::ObserveChildExit, this, child_pid, child_pid);
     } catch (const std::system_error& exception) {
         error = std::string("failed to start child exit observer: ") + exception.what();
-        kill(child_pid, SIGKILL);
+        SignalProcessTree(child_pid, child_pid, SIGKILL);
         ReapChildBlocking(child_pid);
 
         std::scoped_lock state_lock(state_mutex_);
         if (pid_ == child_pid) {
             pid_ = -1;
+            process_group_id_ = -1;
             start_time_.reset();
             TransitionStateLocked(ServiceState::kFailed, error);
         }
@@ -504,29 +555,31 @@ bool ProcessSupervisor::StopOperation(std::string& error, const DesiredState fin
     error.clear();
 
     pid_t target_pid = -1;
+    pid_t target_process_group_id = -1;
 
     {
         std::scoped_lock state_lock(state_mutex_);
 
         desired_state_ = final_desired_state;
 
-        if (pid_ <= 0) {
+        if (pid_ <= 0 && process_group_id_ <= 0) {
             if (final_desired_state == DesiredState::kStopped && state_ != ServiceState::kStopped) {
                 TransitionStateLocked(ServiceState::kStopped);
             }
         } else {
             target_pid = pid_;
+            target_process_group_id = process_group_id_;
             TransitionStateLocked(ServiceState::kStopping);
         }
     }
 
-    if (target_pid <= 0) {
+    if (target_pid <= 0 && target_process_group_id <= 0) {
         JoinObserverThread();
         return true;
     }
 
-    if (kill(target_pid, SIGTERM) != 0 && errno != ESRCH) {
-        error = std::string("SIGTERM failed: ") + std::strerror(errno);
+    if (SignalProcessTree(target_process_group_id, target_pid, SIGTERM) != 0 && errno != ESRCH) {
+        error = std::string("SIGTERM process tree failed: ") + std::strerror(errno);
 
         std::scoped_lock state_lock(state_mutex_);
         if (pid_ == target_pid) {
@@ -535,13 +588,14 @@ bool ProcessSupervisor::StopOperation(std::string& error, const DesiredState fin
         return false;
     }
 
-    if (WaitForObservedExit(target_pid, std::chrono::steady_clock::now() + kGracefulStopTimeout)) {
+    if (WaitForObservedExitAndProcessGroup(target_pid, target_process_group_id,
+                                           std::chrono::steady_clock::now() + kGracefulStopTimeout)) {
         JoinObserverThread();
         return true;
     }
 
-    if (kill(target_pid, SIGKILL) != 0 && errno != ESRCH) {
-        error = std::string("SIGKILL failed: ") + std::strerror(errno);
+    if (SignalProcessTree(target_process_group_id, target_pid, SIGKILL) != 0 && errno != ESRCH) {
+        error = std::string("SIGKILL process tree failed: ") + std::strerror(errno);
 
         std::scoped_lock state_lock(state_mutex_);
         if (pid_ == target_pid) {
@@ -550,7 +604,8 @@ bool ProcessSupervisor::StopOperation(std::string& error, const DesiredState fin
         return false;
     }
 
-    if (WaitForObservedExit(target_pid, std::chrono::steady_clock::now() + kForcedStopTimeout)) {
+    if (WaitForObservedExitAndProcessGroup(target_pid, target_process_group_id,
+                                           std::chrono::steady_clock::now() + kForcedStopTimeout)) {
         JoinObserverThread();
         return true;
     }
@@ -566,12 +621,32 @@ bool ProcessSupervisor::StopOperation(std::string& error, const DesiredState fin
 
     return false;
 }
-bool ProcessSupervisor::WaitForObservedExit(const pid_t target_pid,
-                                            const std::chrono::steady_clock::time_point deadline) {
+bool ProcessSupervisor::WaitForObservedExitAndProcessGroup(const pid_t target_pid, const pid_t target_process_group_id,
+                                                           const std::chrono::steady_clock::time_point deadline) {
     std::unique_lock state_lock(state_mutex_);
-    return exit_condition_.wait_until(state_lock, deadline, [this, target_pid] { return pid_ != target_pid; });
+
+    while (true) {
+        const bool leader_was_observed = target_pid <= 0 || pid_ != target_pid;
+        state_lock.unlock();
+        const bool process_group_is_gone = !ProcessGroupExists(target_process_group_id);
+        state_lock.lock();
+
+        if (leader_was_observed && process_group_is_gone) {
+            if (process_group_id_ == target_process_group_id) {
+                process_group_id_ = -1;
+            }
+            return true;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+
+        exit_condition_.wait_until(state_lock, std::min(deadline, now + kProcessGroupPollInterval));
+    }
 }
-void ProcessSupervisor::ObserveChildExit(const pid_t target_pid) noexcept {
+void ProcessSupervisor::ObserveChildExit(const pid_t target_pid, const pid_t target_process_group_id) noexcept {
     int status = 0;
     pid_t result = -1;
 
@@ -604,6 +679,27 @@ void ProcessSupervisor::ObserveChildExit(const pid_t target_pid) noexcept {
             last_exit_signal_.reset();
             TransitionStateLocked(ServiceState::kFailed,
                                   std::string("waitpid failed for service child: ") + std::strerror(wait_error_number));
+        }
+    }
+
+    exit_condition_.notify_all();
+    CleanupProcessGroupAfterLeaderExit(target_process_group_id);
+}
+void ProcessSupervisor::CleanupProcessGroupAfterLeaderExit(const pid_t target_process_group_id) noexcept {
+    if (ProcessGroupExists(target_process_group_id)) {
+        SignalProcessTree(target_process_group_id, -1, SIGTERM);
+
+        if (!WaitForProcessGroupExit(target_process_group_id,
+                                     std::chrono::steady_clock::now() + kGracefulStopTimeout)) {
+            SignalProcessTree(target_process_group_id, -1, SIGKILL);
+            WaitForProcessGroupExit(target_process_group_id, std::chrono::steady_clock::now() + kForcedStopTimeout);
+        }
+    }
+
+    {
+        std::scoped_lock state_lock(state_mutex_);
+        if (process_group_id_ == target_process_group_id && !ProcessGroupExists(target_process_group_id)) {
+            process_group_id_ = -1;
         }
     }
 

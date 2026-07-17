@@ -39,6 +39,7 @@ struct ServiceStatus {
     ServiceState state{ServiceState::kStopped};
     DesiredState desired_state{DesiredState::kStopped};
     pid_t pid{-1};
+    pid_t process_group_id{-1};
     std::optional<int> exit_code;
     std::chrono::seconds uptime{0};
     ProcessExitKind last_exit_kind{ProcessExitKind::kNone};
@@ -71,9 +72,11 @@ public:
 private:
     bool StartOperation(std::string& error);
     bool StopOperation(std::string& error, DesiredState final_desired_state);
-    bool WaitForObservedExit(pid_t target_pid, std::chrono::steady_clock::time_point deadline);
+    bool WaitForObservedExitAndProcessGroup(pid_t target_pid, pid_t target_process_group_id,
+                                            std::chrono::steady_clock::time_point deadline);
 
-    void ObserveChildExit(pid_t target_pid) noexcept;
+    void ObserveChildExit(pid_t target_pid, pid_t target_process_group_id) noexcept;
+    void CleanupProcessGroupAfterLeaderExit(pid_t target_process_group_id) noexcept;
     void JoinObserverThread() noexcept;
     void SaveExitStatusLocked(int status);
     void MarkChildExitedLocked();
@@ -92,6 +95,7 @@ private:
 
     ServiceState state_{ServiceState::kStopped};
     pid_t pid_{-1};
+    pid_t process_group_id_{-1};
     std::optional<int> last_exit_code_;
     ProcessExitKind last_exit_kind_{ProcessExitKind::kNone};
     std::optional<int> last_exit_signal_;
