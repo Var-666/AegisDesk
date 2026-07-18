@@ -59,6 +59,8 @@ public:
 
     [[nodiscard]] std::optional<AlertEvent> GetAlert(std::string_view alert_id) const;
 
+    [[nodiscard]] std::optional<AlertEvent> AcknowledgeAlertAndGet(std::string_view alert_id);
+
     [[nodiscard]] bool AcknowledgeAlert(std::string_view alert_id);
 
     [[nodiscard]] std::vector<RecoveryEvent> GetRecentRecoveryEvents(std::size_t limit) const;

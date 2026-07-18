@@ -44,6 +44,8 @@ public:
 
     [[nodiscard]] bool HasActiveAlert(std::string_view service_id, std::string_view rule_id) const;
 
+    [[nodiscard]] std::optional<AlertEvent> AcknowledgeAndGet(std::string_view alert_id);
+
     [[nodiscard]] bool Acknowledge(std::string_view alert_id);
 
     void ForgetService(std::string_view service_id);

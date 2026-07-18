@@ -34,7 +34,7 @@ public:
     ProcessSupervisor* Find(std::string_view service_id) noexcept;
     const ProcessSupervisor* Find(std::string_view service_id) const noexcept;
 
-    std::vector<ServiceSummary> ListServices();
+    [[nodiscard]] std::vector<ServiceSummary> ListServices() const;
 
     bool StartAutoStartServices(std::string& error);
 

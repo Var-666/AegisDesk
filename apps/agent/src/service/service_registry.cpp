@@ -613,7 +613,7 @@ const ProcessSupervisor* ServiceRegistry::Find(const std::string_view service_id
 
     return iterator->second.get();
 }
-std::vector<ServiceSummary> ServiceRegistry::ListServices() {
+std::vector<ServiceSummary> ServiceRegistry::ListServices() const {
     std::vector<ServiceSummary> services;
 
     services.reserve(service_order_.size());
@@ -625,7 +625,7 @@ std::vector<ServiceSummary> ServiceRegistry::ListServices() {
             continue;
         }
 
-        ProcessSupervisor& supervisor = *iterator->second;
+        const ProcessSupervisor& supervisor = *iterator->second;
 
         const ServiceDefinition& definition = supervisor.Definition();
 

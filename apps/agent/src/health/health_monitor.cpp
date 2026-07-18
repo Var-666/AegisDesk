@@ -219,6 +219,10 @@ bool HealthMonitor::AcknowledgeAlert(const std::string_view alert_id) {
     return alert_manager_.Acknowledge(alert_id);
 }
 
+std::optional<AlertEvent> HealthMonitor::AcknowledgeAlertAndGet(const std::string_view alert_id) {
+    return alert_manager_.AcknowledgeAndGet(alert_id);
+}
+
 std::vector<RecoveryEvent> HealthMonitor::GetRecentRecoveryEvents(const std::size_t limit) const {
     return recovery_manager_.GetRecentEvents(limit);
 }
