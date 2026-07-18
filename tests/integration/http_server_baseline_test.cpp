@@ -31,7 +31,6 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using tcp = asio::ip::tcp;
 
-constexpr auto kServerStartupTimeout = std::chrono::seconds(5);
 constexpr auto kClientTimeout = std::chrono::seconds(5);
 constexpr auto kSimulatedHandlerWork = std::chrono::milliseconds(10);
 
@@ -44,65 +43,31 @@ public:
                   .port = 0,
               },
               std::move(handler))
-        , worker_([this] { Run(); }) {
-        const auto deadline = std::chrono::steady_clock::now() + kServerStartupTimeout;
-
-        while (server_.BoundPort() == 0 && !finished_.load(std::memory_order_acquire)
-               && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        if (server_.BoundPort() == 0) {
-            Stop();
-            RethrowWorkerError();
-            throw std::runtime_error("HTTP server did not bind before the startup timeout");
-        }
-    }
+        , port_(server_.Start()) {}
 
     RunningHttpServer(const RunningHttpServer&) = delete;
     RunningHttpServer& operator=(const RunningHttpServer&) = delete;
 
     ~RunningHttpServer() {
-        Stop();
+        try {
+            Stop();
+        } catch (...) {}
     }
 
     [[nodiscard]] unsigned short Port() const noexcept {
-        return server_.BoundPort();
+        return port_;
     }
 
-    void Stop() noexcept {
-        stop_requested_.store(true, std::memory_order_release);
-
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-    }
-
-    void RethrowWorkerError() const {
-        std::lock_guard lock(error_mutex_);
-        if (worker_error_) {
-            std::rethrow_exception(worker_error_);
+    void Stop() {
+        if (server_.State() != agent::HttpServerState::kStopped) {
+            server_.RequestStop();
+            server_.Wait();
         }
     }
 
 private:
-    void Run() noexcept {
-        try {
-            server_.Run([this] { return stop_requested_.load(std::memory_order_acquire); });
-        } catch (...) {
-            std::lock_guard lock(error_mutex_);
-            worker_error_ = std::current_exception();
-        }
-
-        finished_.store(true, std::memory_order_release);
-    }
-
     agent::HttpServer server_;
-    std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> finished_{false};
-    mutable std::mutex error_mutex_;
-    std::exception_ptr worker_error_;
-    std::thread worker_;
+    unsigned short port_{0};
 };
 
 agent::HttpResponse SendGetRequest(const unsigned short port, const std::string& target) {
@@ -203,7 +168,100 @@ TEST(HttpServerIntegrationTest, BindsToEphemeralPortAndServesRequest) {
     EXPECT_EQ(response.body(), R"({"status":"ok"})");
 
     server.Stop();
-    server.RethrowWorkerError();
+}
+
+TEST(HttpServerLifecycleTest, SupportsExplicitStopAndRestartOnTheSameInstance) {
+    agent::HttpServer server(
+        {
+            .bind_address = "127.0.0.1",
+            .port = 0,
+        },
+        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    EXPECT_EQ(server.BoundPort(), 0);
+    EXPECT_EQ(server.Options().io_thread_count, 1U);
+    EXPECT_EQ(server.Options().handler_thread_count, 4U);
+
+    const unsigned short first_port = server.Start();
+    ASSERT_NE(first_port, 0);
+    EXPECT_EQ(server.BoundPort(), first_port);
+    EXPECT_EQ(server.State(), agent::HttpServerState::kRunning);
+    EXPECT_THROW(static_cast<void>(server.Start()), std::logic_error);
+
+    const agent::HttpResponse first_response = SendGetRequest(first_port, "/first");
+    EXPECT_EQ(first_response.result(), http::status::ok);
+
+    server.RequestStop();
+    server.RequestStop();
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopping);
+    server.Wait();
+
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    EXPECT_EQ(server.BoundPort(), 0);
+
+    const unsigned short second_port = server.Start();
+    ASSERT_NE(second_port, 0);
+    const agent::HttpResponse second_response = SendGetRequest(second_port, "/second");
+    EXPECT_EQ(second_response.result(), http::status::ok);
+
+    server.RequestStop();
+    server.Wait();
+}
+
+TEST(HttpServerLifecycleTest, RejectsInvalidConfigurationWithoutLeavingPartialState) {
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.handler_thread_count = 0;
+
+    agent::HttpServer server(
+        options,
+        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+
+    EXPECT_THROW(static_cast<void>(server.Start()), std::invalid_argument);
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    EXPECT_EQ(server.BoundPort(), 0);
+}
+
+TEST(HttpServerLifecycleTest, RunRemainsACompatibleBlockingEntryPoint) {
+    agent::HttpServer server(
+        {
+            .bind_address = "127.0.0.1",
+            .port = 0,
+        },
+        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+
+    std::atomic_bool stop_requested{false};
+    std::exception_ptr run_error;
+    std::thread runner([&] {
+        try {
+            server.Run([&] { return stop_requested.load(std::memory_order_acquire); });
+        } catch (...) {
+            run_error = std::current_exception();
+        }
+    });
+
+    const auto startup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (server.BoundPort() == 0 && std::chrono::steady_clock::now() < startup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const unsigned short port = server.BoundPort();
+    if (port != 0) {
+        const agent::HttpResponse response = SendGetRequest(port, "/compatibility");
+        EXPECT_EQ(response.result(), http::status::ok);
+    }
+
+    stop_requested.store(true, std::memory_order_release);
+    runner.join();
+
+    if (run_error != nullptr) {
+        std::rethrow_exception(run_error);
+    }
+
+    EXPECT_NE(port, 0);
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    EXPECT_EQ(server.BoundPort(), 0);
 }
 
 TEST(HttpServerBaselineTest, RecordsSerialServerConcurrencyBaseline) {
@@ -224,7 +282,6 @@ TEST(HttpServerBaselineTest, RecordsSerialServerConcurrencyBaseline) {
     }
 
     server.Stop();
-    server.RethrowWorkerError();
 }
 
 } // namespace
