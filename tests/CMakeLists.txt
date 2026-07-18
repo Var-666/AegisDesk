@@ -64,7 +64,17 @@ endif ()
 gtest_discover_tests(
         aegis_http_server_tests
         DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "HttpServerBaselineTest.*"
         PROPERTIES
         LABELS baseline
+        TIMEOUT 180
+)
+
+gtest_discover_tests(
+        aegis_http_server_tests
+        DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "HttpServerIntegrationTest.*:HttpServerLifecycleTest.*"
+        PROPERTIES
+        LABELS integration
         TIMEOUT 180
 )
