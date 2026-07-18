@@ -302,7 +302,7 @@ AgentApi::AgentApi(ServiceRegistry& registry, MetricsCollector& metrics_collecto
     : registry_(registry)
     , metrics_collector_(metrics_collector)
     , health_monitor_(health_monitor) {}
-HttpResponse AgentApi::Handle(const HttpRequest& request) {
+HttpResponse AgentApi::Handle(const HttpRequest& request) const {
     const std::string_view target = RequestTarget(request);
     const std::string_view path = PathOnly(target);
 
@@ -458,7 +458,7 @@ HttpResponse AgentApi::MakeServiceListResponse() const {
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeStatusResponse(ProcessSupervisor& supervisor) {
+HttpResponse AgentApi::MakeStatusResponse(const ProcessSupervisor& supervisor) const {
     const ServiceDefinition& definition = supervisor.Definition();
     const ServiceStatus status = supervisor.GetStatus();
 
@@ -474,7 +474,7 @@ HttpResponse AgentApi::MakeStatusResponse(ProcessSupervisor& supervisor) {
 
     return MakeJsonResponse(http::status::ok, body.str());
 }
-HttpResponse AgentApi::MakeActionResponse(ProcessSupervisor& supervisor, const std::string_view action) {
+HttpResponse AgentApi::MakeActionResponse(ProcessSupervisor& supervisor, const std::string_view action) const {
     std::string error;
     bool success = false;
 
@@ -494,7 +494,7 @@ HttpResponse AgentApi::MakeActionResponse(ProcessSupervisor& supervisor, const s
 
     return MakeStatusResponse(supervisor);
 }
-HttpResponse AgentApi::MakeLogsResponse(const ProcessSupervisor& supervisor, const std::size_t tail) {
+HttpResponse AgentApi::MakeLogsResponse(const ProcessSupervisor& supervisor, const std::size_t tail) const {
     const ServiceDefinition& definition = supervisor.Definition();
 
     std::string error;
@@ -688,16 +688,11 @@ HttpResponse AgentApi::MakeAcknowledgeAlertResponse(const std::string_view alert
         return MakeErrorResponse(http::status::bad_request, "invalid_alert_id", "alert_id has an invalid format");
     }
 
-    if (!health_monitor_.AcknowledgeAlert(alert_id)) {
-        return MakeErrorResponse(http::status::not_found, "alert_not_found",
-                                 "alert does not exist: " + std::string(alert_id));
-    }
-
-    const std::optional<AlertEvent> alert = health_monitor_.GetAlert(alert_id);
+    const std::optional<AlertEvent> alert = health_monitor_.AcknowledgeAlertAndGet(alert_id);
 
     if (!alert.has_value()) {
-        return MakeErrorResponse(http::status::internal_server_error, "alert_acknowledged_but_not_readable",
-                                 "alert was acknowledged but could not be read back");
+        return MakeErrorResponse(http::status::not_found, "alert_not_found",
+                                 "alert does not exist: " + std::string(alert_id));
     }
 
     std::ostringstream body;

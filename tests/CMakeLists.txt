@@ -24,6 +24,7 @@ add_executable(aegis_agent_core_tests
         unit/process_supervisor_state_test.cpp
         unit/recovery_manager_test.cpp
         unit/agent_api_status_test.cpp
+        unit/agent_api_concurrency_test.cpp
         support/test_builders.h
 )
 
