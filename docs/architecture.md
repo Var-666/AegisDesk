@@ -4,7 +4,7 @@
 flowchart LR
     Desktop["Qt Desktop\nservice controls and diagnostics"]
     Listener["Async HTTP Listener\nacceptor strand"]
-    Session["HTTP Sessions\nper-connection strand"]
+    Session["HTTP Sessions\nparser limits + Keep-Alive strand"]
     Executor["Bounded Request Executor\nfixed workers + backpressure"]
     API["HTTP JSON API\nbackward-compatible v1 fields"]
     Registry["Service Registry\nconfig and ownership"]
@@ -42,9 +42,11 @@ flowchart LR
 | API request reentrancy | Stateless `AgentApi`; no global request mutex |
 | HTTP accept lifecycle | Listener strand + asynchronous accept |
 | Per-connection I/O | Session-owned strand + asynchronous read/write |
+| HTTP resource limits | Per-request parser limits + per-connection request and idle limits |
 | Active connection ownership | Server session registry |
 | Business request execution | Fixed Handler workers; never runs on I/O workers |
 | Request backpressure | Bounded in-flight counter covering running and queued tasks; overflow returns HTTP 503 |
+| Graceful HTTP shutdown | Listener stop + task drain + connection grace timer + forced socket close |
 | Registry topology | Startup load, then immutable concurrent reads |
 | Start/stop/restart serialization | Per-service operation mutex |
 | Lifecycle snapshot | Per-service state mutex |

@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -42,7 +44,8 @@ void CloseSocket(tcp::socket& socket) noexcept {
 HttpServer::HttpServer(HttpServerOptions options, RequestHandler handler)
     : options_(std::move(options))
     , handler_(std::move(handler))
-    , acceptor_(asio::make_strand(io_context_)) {}
+    , acceptor_(asio::make_strand(io_context_))
+    , shutdown_timer_(acceptor_.get_executor()) {}
 
 HttpServer::~HttpServer() noexcept {
     RequestStop();
@@ -60,9 +63,11 @@ unsigned short HttpServer::Start() {
 
     state_ = HttpServerState::kStarting;
     stop_requested_.store(false, std::memory_order_release);
+    handler_executor_drained_.store(false, std::memory_order_release);
     running_io_workers_.store(0, std::memory_order_release);
     bound_port_.store(0, std::memory_order_release);
     worker_error_ = nullptr;
+    stop_completion_started_ = false;
 
     try {
         const unsigned short port = PrepareAcceptor();
@@ -195,8 +200,10 @@ void HttpServer::Wait() {
         request_executor->Wait();
     }
 
+    handler_executor_drained_.store(true, std::memory_order_release);
+
     try {
-        asio::post(acceptor_.get_executor(), [this] { work_guard_.reset(); });
+        asio::post(acceptor_.get_executor(), [this] { TryCompleteStopOnIoContext(); });
     } catch (...) {
         work_guard_.reset();
         io_context_.stop();
@@ -315,12 +322,14 @@ void HttpServer::ValidateOptions() const {
             "HTTP server request limits must be positive and in-flight requests must not exceed connections");
     }
 
-    if (options_.max_header_bytes == 0 || options_.max_body_bytes == 0 || options_.max_requests_per_connection == 0) {
+    if (options_.max_header_bytes == 0 || options_.max_header_bytes > std::numeric_limits<std::uint32_t>::max()
+        || options_.max_body_bytes == 0 || options_.max_requests_per_connection == 0) {
         throw std::invalid_argument("HTTP server protocol limits must be greater than zero");
     }
 
     if (options_.read_timeout <= std::chrono::seconds::zero() || options_.write_timeout <= std::chrono::seconds::zero()
-        || options_.idle_timeout <= std::chrono::seconds::zero()) {
+        || options_.idle_timeout <= std::chrono::seconds::zero()
+        || options_.shutdown_grace_period <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("HTTP server timeouts must be greater than zero");
     }
 }
@@ -406,8 +415,21 @@ bool HttpServer::RegisterSession(const std::shared_ptr<HttpSession>& session) {
 }
 
 void HttpServer::RemoveSession(const std::shared_ptr<HttpSession>& session) noexcept {
-    std::scoped_lock lock(sessions_mutex_);
-    sessions_.erase(session);
+    bool sessions_empty = false;
+    {
+        std::scoped_lock lock(sessions_mutex_);
+        sessions_.erase(session);
+        sessions_empty = sessions_.empty();
+    }
+
+    if (sessions_empty && stop_requested_.load(std::memory_order_acquire)
+        && handler_executor_drained_.load(std::memory_order_acquire)) {
+        try {
+            asio::post(acceptor_.get_executor(), [this] { TryCompleteStopOnIoContext(); });
+        } catch (...) {
+            io_context_.stop();
+        }
+    }
 }
 
 void HttpServer::StopOnIoContext() noexcept {
@@ -420,8 +442,59 @@ void HttpServer::StopOnIoContext() noexcept {
     }
 
     for (const std::shared_ptr<HttpSession>& session : sessions) {
+        session->BeginDrain();
+    }
+
+    if (!sessions.empty()) {
+        shutdown_timer_.expires_after(options_.shutdown_grace_period);
+        shutdown_timer_.async_wait(beast::bind_front_handler(&HttpServer::HandleShutdownDeadline, this));
+    }
+
+    TryCompleteStopOnIoContext();
+}
+
+void HttpServer::HandleShutdownDeadline(const beast::error_code& error) noexcept {
+    if (error == asio::error::operation_aborted) {
+        return;
+    }
+
+    if (error) {
+        std::cerr << "[agent] graceful shutdown timer failed: " << error.message() << '\n';
+    }
+
+    ForceCloseSessions();
+    TryCompleteStopOnIoContext();
+}
+
+void HttpServer::ForceCloseSessions() noexcept {
+    std::vector<std::shared_ptr<HttpSession>> sessions;
+    {
+        std::scoped_lock lock(sessions_mutex_);
+        sessions.assign(sessions_.begin(), sessions_.end());
+    }
+
+    for (const std::shared_ptr<HttpSession>& session : sessions) {
         session->RequestStop();
     }
+}
+
+void HttpServer::TryCompleteStopOnIoContext() noexcept {
+    if (stop_completion_started_ || !handler_executor_drained_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    {
+        std::scoped_lock lock(sessions_mutex_);
+        if (!sessions_.empty()) {
+            return;
+        }
+    }
+
+    stop_completion_started_ = true;
+    try {
+        static_cast<void>(shutdown_timer_.cancel());
+    } catch (...) {}
+    work_guard_.reset();
 }
 
 void HttpServer::RunIoContext() noexcept {

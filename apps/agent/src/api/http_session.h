@@ -7,9 +7,12 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/core/tcp_stream.hpp>
+#include <boost/beast/http/parser.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace aegis::agent {
 
@@ -24,14 +27,23 @@ public:
 
     void RequestStop() noexcept;
 
+    void BeginDrain() noexcept;
+
 private:
+    enum class State {
+        kReading,
+        kHandling,
+        kWriting,
+        kClosed,
+    };
+
     void ReadRequest();
 
     void HandleRead(const boost::system::error_code& error, std::size_t bytes_transferred);
 
     void ExecuteRequest(HttpRequest request) noexcept;
 
-    void WriteResponse(HttpResponse response);
+    void WriteResponse(HttpResponse response, bool force_close = false);
 
     void HandleWrite(const boost::system::error_code& error, std::size_t bytes_transferred);
 
@@ -47,9 +59,15 @@ private:
     std::shared_ptr<BoundedRequestExecutor> request_executor_;
     CloseHandler close_handler_;
     boost::beast::flat_buffer buffer_;
+    std::optional<boost::beast::http::request_parser<boost::beast::http::string_body>> parser_;
     HttpRequest request_;
     HttpResponse response_;
-    bool closed_{false};
+    std::size_t request_count_{0};
+    unsigned request_version_{11};
+    bool request_keep_alive_{false};
+    bool close_after_response_{true};
+    std::atomic_bool drain_requested_{false};
+    State state_{State::kReading};
 };
 
 } // namespace aegis::agent
