@@ -79,10 +79,6 @@ void BoundedRequestExecutor::RequestStop() noexcept {
         std::scoped_lock lock(mutex_);
         accepting_ = false;
         stop_requested_ = true;
-
-        const std::size_t queued_task_count = tasks_.size();
-        tasks_.clear();
-        in_flight_count_ -= queued_task_count;
     }
 
     condition_.notify_all();

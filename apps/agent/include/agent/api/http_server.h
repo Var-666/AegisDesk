@@ -5,6 +5,7 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,7 @@ struct HttpServerOptions {
     std::chrono::seconds read_timeout{5};
     std::chrono::seconds write_timeout{15};
     std::chrono::seconds idle_timeout{30};
+    std::chrono::milliseconds shutdown_grace_period{5000};
 };
 
 class HttpServer {
@@ -94,6 +96,12 @@ private:
 
     void StopOnIoContext() noexcept;
 
+    void HandleShutdownDeadline(const boost::system::error_code& error) noexcept;
+
+    void ForceCloseSessions() noexcept;
+
+    void TryCompleteStopOnIoContext() noexcept;
+
     void RunIoContext() noexcept;
 
     void CloseAcceptor() noexcept;
@@ -105,17 +113,20 @@ private:
     RequestHandler handler_;
     boost::asio::io_context io_context_{-1};
     boost::asio::ip::tcp::acceptor acceptor_;
+    boost::asio::steady_timer shutdown_timer_;
 
     using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
     std::optional<WorkGuard> work_guard_;
 
     std::atomic<unsigned short> bound_port_{0};
     std::atomic_bool stop_requested_{false};
+    std::atomic_bool handler_executor_drained_{false};
     std::atomic_size_t running_io_workers_{0};
 
     mutable std::mutex sessions_mutex_;
     std::unordered_set<std::shared_ptr<HttpSession>> sessions_;
     std::shared_ptr<BoundedRequestExecutor> request_executor_;
+    bool stop_completion_started_{false};
 
     mutable std::mutex lifecycle_mutex_;
     std::condition_variable lifecycle_condition_;

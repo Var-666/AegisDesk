@@ -92,6 +92,15 @@ agent::HttpResponse SendGetRequest(const unsigned short port, const std::string&
     return response;
 }
 
+agent::HttpResponse ExchangeRequest(beast::tcp_stream& stream, agent::HttpRequest request) {
+    http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    agent::HttpResponse response;
+    http::read(stream, buffer, response);
+    return response;
+}
+
 template <typename Predicate> bool WaitUntil(Predicate&& predicate, const std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
@@ -245,6 +254,32 @@ TEST(HttpServerLifecycleTest, RejectsInvalidConfigurationWithoutLeavingPartialSt
     EXPECT_EQ(server.BoundPort(), 0);
 }
 
+TEST(HttpServerLifecycleTest, RejectsInvalidProtocolAndShutdownLimits) {
+    const auto handler = [](const agent::HttpRequest&) {
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    };
+
+    {
+        agent::HttpServerOptions options;
+        options.port = 0;
+        options.max_header_bytes = 0;
+        agent::HttpServer server(options, handler);
+
+        EXPECT_THROW(static_cast<void>(server.Start()), std::invalid_argument);
+        EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    }
+
+    {
+        agent::HttpServerOptions options;
+        options.port = 0;
+        options.shutdown_grace_period = std::chrono::milliseconds::zero();
+        agent::HttpServer server(options, handler);
+
+        EXPECT_THROW(static_cast<void>(server.Start()), std::invalid_argument);
+        EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    }
+}
+
 TEST(HttpServerLifecycleTest, RunRemainsACompatibleBlockingEntryPoint) {
     agent::HttpServer server(
         {
@@ -320,6 +355,162 @@ TEST(HttpServerAsyncSessionTest, IdleClientDoesNotBlockACompleteRequestOnOneIoTh
 
     beast::error_code ignored_error;
     idle_client.close(ignored_error);
+}
+
+TEST(HttpServerProtocolTest, EnforcesHeaderAndBodyLimits) {
+    std::atomic_size_t handler_calls{0};
+
+    {
+        agent::HttpServerOptions options;
+        options.port = 0;
+        options.max_header_bytes = 128;
+
+        agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+            handler_calls.fetch_add(1, std::memory_order_relaxed);
+            return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+        });
+
+        const unsigned short port = server.Start();
+        asio::io_context io_context;
+        beast::tcp_stream stream(io_context);
+        stream.expires_after(kClientTimeout);
+        stream.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+        agent::HttpRequest request{http::verb::get, "/large-header", 11};
+        request.set(http::field::host, "127.0.0.1");
+        request.set("X-Oversized-Header", std::string(512, 'x'));
+        const agent::HttpResponse response = ExchangeRequest(stream, std::move(request));
+
+        EXPECT_EQ(response.result(), http::status::request_header_fields_too_large);
+        EXPECT_NE(response.body().find("header_too_large"), std::string::npos);
+
+        server.RequestStop();
+        server.Wait();
+    }
+
+    {
+        agent::HttpServerOptions options;
+        options.port = 0;
+        options.max_body_bytes = 8;
+
+        agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+            handler_calls.fetch_add(1, std::memory_order_relaxed);
+            return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+        });
+
+        const unsigned short port = server.Start();
+        asio::io_context io_context;
+        beast::tcp_stream stream(io_context);
+        stream.expires_after(kClientTimeout);
+        stream.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+        agent::HttpRequest request{http::verb::post, "/large-body", 11};
+        request.set(http::field::host, "127.0.0.1");
+        request.body() = std::string(64, 'b');
+        request.prepare_payload();
+        const agent::HttpResponse response = ExchangeRequest(stream, std::move(request));
+
+        EXPECT_EQ(response.result(), http::status::payload_too_large);
+        EXPECT_NE(response.body().find("body_too_large"), std::string::npos);
+
+        server.RequestStop();
+        server.Wait();
+    }
+
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(HttpServerProtocolTest, MalformedRequestReturnsBadRequest) {
+    agent::HttpServerOptions options;
+    options.port = 0;
+
+    agent::HttpServer server(options, [](const agent::HttpRequest&) {
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    asio::io_context io_context;
+    beast::tcp_stream stream(io_context);
+    stream.expires_after(kClientTimeout);
+    stream.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+    const std::string malformed_request = "GET / HTTP/1.1\r\nInvalid Header\r\n\r\n";
+    asio::write(stream.socket(), asio::buffer(malformed_request));
+
+    beast::flat_buffer buffer;
+    agent::HttpResponse response;
+    http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), http::status::bad_request);
+    EXPECT_NE(response.body().find("malformed_request"), std::string::npos);
+
+    server.RequestStop();
+    server.Wait();
+}
+
+TEST(HttpServerProtocolTest, ReusesConnectionUntilConfiguredRequestLimit) {
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.max_requests_per_connection = 2;
+
+    std::atomic_size_t handler_calls{0};
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    asio::io_context io_context;
+    beast::tcp_stream stream(io_context);
+    stream.expires_after(kClientTimeout);
+    stream.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+    agent::HttpRequest first_request{http::verb::get, "/first", 11};
+    first_request.set(http::field::host, "127.0.0.1");
+    first_request.keep_alive(true);
+    const agent::HttpResponse first_response = ExchangeRequest(stream, std::move(first_request));
+
+    agent::HttpRequest second_request{http::verb::get, "/second", 11};
+    second_request.set(http::field::host, "127.0.0.1");
+    second_request.keep_alive(true);
+    const agent::HttpResponse second_response = ExchangeRequest(stream, std::move(second_request));
+
+    EXPECT_EQ(first_response.result(), http::status::ok);
+    EXPECT_TRUE(first_response.keep_alive());
+    EXPECT_EQ(second_response.result(), http::status::ok);
+    EXPECT_FALSE(second_response.keep_alive());
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 2U);
+    EXPECT_TRUE(WaitUntil([&] { return server.ActiveSessionCount() == 0; }, kConditionTimeout));
+
+    server.RequestStop();
+    server.Wait();
+}
+
+TEST(HttpServerProtocolTest, ClosesIdleKeepAliveConnectionAfterIdleTimeout) {
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.idle_timeout = std::chrono::seconds(1);
+
+    agent::HttpServer server(options, [](const agent::HttpRequest&) {
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    asio::io_context io_context;
+    beast::tcp_stream stream(io_context);
+    stream.expires_after(kClientTimeout);
+    stream.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+    agent::HttpRequest request{http::verb::get, "/idle", 11};
+    request.set(http::field::host, "127.0.0.1");
+    request.keep_alive(true);
+    const agent::HttpResponse response = ExchangeRequest(stream, std::move(request));
+
+    ASSERT_TRUE(response.keep_alive());
+    EXPECT_TRUE(WaitUntil([&] { return server.ActiveSessionCount() == 0; }, std::chrono::milliseconds(2500)));
+
+    server.RequestStop();
+    server.Wait();
 }
 
 TEST(HttpServerBusinessIsolationTest, ConfiguredHandlerWorkersExecuteConcurrentlyWithOneIoWorker) {
@@ -459,7 +650,7 @@ TEST(HttpServerBackpressureTest, SaturatedExecutorReturnsServiceUnavailableWitho
     server.Wait();
 }
 
-TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHandler) {
+TEST(HttpServerGracefulShutdownTest, DrainsQueuedWorkAndWaitsForRunningHandlers) {
     std::mutex handler_mutex;
     std::condition_variable handler_condition;
     bool release_handler = false;
@@ -485,10 +676,17 @@ TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHand
     });
 
     const unsigned short port = server.Start();
+    std::optional<agent::HttpResponse> first_response;
+    std::optional<agent::HttpResponse> queued_response;
+    std::exception_ptr first_request_error;
+    std::exception_ptr queued_request_error;
+
     std::thread first_client([&] {
         try {
-            static_cast<void>(SendGetRequest(port, "/running"));
-        } catch (const std::exception&) {}
+            first_response = SendGetRequest(port, "/running");
+        } catch (...) {
+            first_request_error = std::current_exception();
+        }
     });
 
     const bool started = WaitUntil([&] { return handler_started.load(std::memory_order_acquire); }, kConditionTimeout);
@@ -507,8 +705,10 @@ TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHand
 
     std::thread queued_client([&] {
         try {
-            static_cast<void>(SendGetRequest(port, "/queued"));
-        } catch (const std::exception&) {}
+            queued_response = SendGetRequest(port, "/queued");
+        } catch (...) {
+            queued_request_error = std::current_exception();
+        }
     });
 
     const bool queued = WaitUntil([&] { return server.InFlightRequestCount() == 2; }, kConditionTimeout);
@@ -536,7 +736,7 @@ TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHand
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_FALSE(wait_completed.load(std::memory_order_acquire));
     EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1U);
-    EXPECT_EQ(server.InFlightRequestCount(), 1U);
+    EXPECT_EQ(server.InFlightRequestCount(), 2U);
 
     {
         std::scoped_lock lock(handler_mutex);
@@ -549,8 +749,86 @@ TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHand
     waiter.join();
 
     EXPECT_TRUE(wait_completed.load(std::memory_order_acquire));
-    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 2U);
     EXPECT_EQ(server.InFlightRequestCount(), 0U);
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+    EXPECT_EQ(first_request_error, nullptr);
+    EXPECT_EQ(queued_request_error, nullptr);
+    ASSERT_TRUE(first_response.has_value());
+    ASSERT_TRUE(queued_response.has_value());
+    EXPECT_EQ(first_response->result(), http::status::ok);
+    EXPECT_EQ(queued_response->result(), http::status::ok);
+    EXPECT_FALSE(first_response->keep_alive());
+    EXPECT_FALSE(queued_response->keep_alive());
+}
+
+TEST(HttpServerGracefulShutdownTest, GraceDeadlineClosesConnectionButStillJoinsRunningHandler) {
+    std::mutex handler_mutex;
+    std::condition_variable handler_condition;
+    bool release_handler = false;
+    std::atomic_bool handler_started{false};
+
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.shutdown_grace_period = std::chrono::milliseconds(100);
+
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        std::unique_lock lock(handler_mutex);
+        handler_started.store(true, std::memory_order_release);
+        handler_condition.notify_all();
+        handler_condition.wait(lock, [&] { return release_handler; });
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    std::optional<agent::HttpResponse> response;
+    std::exception_ptr request_error;
+    std::thread client([&] {
+        try {
+            response = SendGetRequest(port, "/past-grace-period");
+        } catch (...) {
+            request_error = std::current_exception();
+        }
+    });
+
+    const bool started = WaitUntil([&] { return handler_started.load(std::memory_order_acquire); }, kConditionTimeout);
+    if (!started) {
+        {
+            std::scoped_lock lock(handler_mutex);
+            release_handler = true;
+        }
+        handler_condition.notify_all();
+        client.join();
+        server.RequestStop();
+        server.Wait();
+        FAIL() << "the handler did not start";
+        return;
+    }
+
+    server.RequestStop();
+    std::atomic_bool wait_completed{false};
+    std::thread waiter([&] {
+        server.Wait();
+        wait_completed.store(true, std::memory_order_release);
+    });
+
+    const bool connection_closed =
+        WaitUntil([&] { return server.ActiveSessionCount() == 0; }, std::chrono::milliseconds(1500));
+    EXPECT_TRUE(connection_closed);
+    EXPECT_FALSE(wait_completed.load(std::memory_order_acquire));
+
+    {
+        std::scoped_lock lock(handler_mutex);
+        release_handler = true;
+    }
+    handler_condition.notify_all();
+
+    client.join();
+    waiter.join();
+
+    EXPECT_FALSE(response.has_value());
+    EXPECT_NE(request_error, nullptr);
+    EXPECT_TRUE(wait_completed.load(std::memory_order_acquire));
     EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
 }
 
