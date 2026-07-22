@@ -73,7 +73,7 @@ gtest_discover_tests(
 gtest_discover_tests(
         aegis_http_server_tests
         DISCOVERY_MODE PRE_TEST
-        TEST_FILTER "HttpServerIntegrationTest.*:HttpServerLifecycleTest.*:HttpServerAsyncSessionTest.*"
+        TEST_FILTER "HttpServerIntegrationTest.*:HttpServerLifecycleTest.*:HttpServerAsyncSessionTest.*:HttpServerBusinessIsolationTest.*:HttpServerBackpressureTest.*"
         PROPERTIES
         LABELS integration
         TIMEOUT 180

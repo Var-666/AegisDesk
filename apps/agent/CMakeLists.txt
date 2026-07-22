@@ -74,6 +74,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif ()
 
 add_library(aegis_agent_http STATIC
+        src/api/bounded_request_executor.cpp
+        src/api/bounded_request_executor.h
         src/api/http_session.cpp
         src/api/http_session.h
         src/api/http_server.cpp

@@ -23,6 +23,7 @@
 namespace aegis::agent {
 
 class HttpSession;
+class BoundedRequestExecutor;
 
 enum class HttpServerState {
     kStopped,
@@ -76,6 +77,8 @@ public:
 
     [[nodiscard]] std::size_t ActiveSessionCount() const noexcept;
 
+    [[nodiscard]] std::size_t InFlightRequestCount() const noexcept;
+
 private:
     void ValidateOptions() const;
 
@@ -112,6 +115,7 @@ private:
 
     mutable std::mutex sessions_mutex_;
     std::unordered_set<std::shared_ptr<HttpSession>> sessions_;
+    std::shared_ptr<BoundedRequestExecutor> request_executor_;
 
     mutable std::mutex lifecycle_mutex_;
     std::condition_variable lifecycle_condition_;
