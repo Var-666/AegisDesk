@@ -30,8 +30,7 @@ namespace http = beast::http;
            || error == http::error::bad_field || error == http::error::bad_value
            || error == http::error::bad_content_length || error == http::error::bad_transfer_encoding
            || error == http::error::bad_chunk || error == http::error::bad_chunk_extension
-           || error == http::error::bad_obs_fold || error == http::error::multiple_content_length
-           || error == http::error::header_field_name_too_large || error == http::error::header_field_value_too_large;
+           || error == http::error::bad_obs_fold || error == http::error::multiple_content_length;
 }
 
 } // namespace
