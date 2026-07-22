@@ -2,6 +2,7 @@
 
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/error.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/beast/core/bind_handler.hpp>
 #include <boost/beast/http.hpp>
 
@@ -25,19 +26,21 @@ namespace http = beast::http;
 } // namespace
 
 HttpSession::HttpSession(asio::ip::tcp::socket socket, HttpServerOptions options, HttpServer::RequestHandler handler,
-                         CloseHandler close_handler)
+                         std::shared_ptr<BoundedRequestExecutor> request_executor, CloseHandler close_handler)
     : stream_(std::move(socket))
+    , io_executor_(stream_.get_executor())
     , options_(std::move(options))
     , handler_(std::move(handler))
+    , request_executor_(std::move(request_executor))
     , close_handler_(std::move(close_handler)) {}
 
 void HttpSession::Start() {
-    asio::dispatch(stream_.get_executor(), [self = shared_from_this()] { self->ReadRequest(); });
+    asio::dispatch(io_executor_, [self = shared_from_this()] { self->ReadRequest(); });
 }
 
 void HttpSession::RequestStop() noexcept {
     try {
-        asio::dispatch(stream_.get_executor(), [self = shared_from_this()] { self->Close(); });
+        asio::dispatch(io_executor_, [self = shared_from_this()] { self->Close(); });
     } catch (...) {
         CloseWithoutCallback();
     }
@@ -62,14 +65,57 @@ void HttpSession::HandleRead(const beast::error_code& error, const std::size_t) 
         return;
     }
 
+    bool submitted = false;
+
     try {
-        response_ = handler_(request_);
+        submitted =
+            request_executor_ != nullptr
+            && request_executor_->TrySubmit([self = shared_from_this(), request = std::move(request_)]() mutable {
+                   self->ExecuteRequest(std::move(request));
+               });
     } catch (const std::exception& exception) {
-        response_ = MakeErrorResponse(http::status::internal_server_error, "internal_error", exception.what());
+        WriteResponse(MakeErrorResponse(http::status::internal_server_error, "dispatch_failed", exception.what()));
+        return;
     } catch (...) {
-        response_ = MakeErrorResponse(http::status::internal_server_error, "internal_error", "unknown server error");
+        WriteResponse(MakeErrorResponse(http::status::internal_server_error, "dispatch_failed",
+                                        "unknown request dispatch error"));
+        return;
     }
 
+    if (!submitted) {
+        HttpResponse response = MakeErrorResponse(http::status::service_unavailable, "server_overloaded",
+                                                  "too many requests are already in flight");
+        response.set(http::field::retry_after, "1");
+        WriteResponse(std::move(response));
+    }
+}
+
+void HttpSession::ExecuteRequest(HttpRequest request) noexcept {
+    HttpResponse response;
+
+    try {
+        response = handler_(request);
+    } catch (const std::exception& exception) {
+        response = MakeErrorResponse(http::status::internal_server_error, "internal_error", exception.what());
+    } catch (...) {
+        response = MakeErrorResponse(http::status::internal_server_error, "internal_error", "unknown server error");
+    }
+
+    try {
+        asio::post(io_executor_, [self = shared_from_this(), response = std::move(response)]() mutable {
+            self->WriteResponse(std::move(response));
+        });
+    } catch (...) {
+        // The server shutdown path owns socket cancellation and Session reclamation.
+    }
+}
+
+void HttpSession::WriteResponse(HttpResponse response) {
+    if (closed_) {
+        return;
+    }
+
+    response_ = std::move(response);
     response_.keep_alive(false);
     stream_.expires_after(options_.write_timeout);
     http::async_write(stream_, response_, beast::bind_front_handler(&HttpSession::HandleWrite, shared_from_this()));

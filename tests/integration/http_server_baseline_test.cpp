@@ -17,6 +17,7 @@
 #include <exception>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -106,9 +107,9 @@ template <typename Predicate> bool WaitUntil(Predicate&& predicate, const std::c
 
 void UpdateMaximum(std::atomic_size_t& maximum, const std::size_t candidate) {
     std::size_t observed = maximum.load(std::memory_order_relaxed);
-    while (candidate > observed
-           && !maximum.compare_exchange_weak(observed, candidate, std::memory_order_relaxed,
-                                             std::memory_order_relaxed)) {}
+    while (
+        candidate > observed
+        && !maximum.compare_exchange_weak(observed, candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
 
 struct BaselineResult {
@@ -235,9 +236,9 @@ TEST(HttpServerLifecycleTest, RejectsInvalidConfigurationWithoutLeavingPartialSt
     options.port = 0;
     options.handler_thread_count = 0;
 
-    agent::HttpServer server(
-        options,
-        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+    agent::HttpServer server(options, [](const agent::HttpRequest&) {
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
 
     EXPECT_THROW(static_cast<void>(server.Start()), std::invalid_argument);
     EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
@@ -291,9 +292,9 @@ TEST(HttpServerAsyncSessionTest, IdleClientDoesNotBlockACompleteRequestOnOneIoTh
     options.io_thread_count = 1;
     options.read_timeout = std::chrono::seconds(5);
 
-    agent::HttpServer server(
-        options,
-        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+    agent::HttpServer server(options, [](const agent::HttpRequest&) {
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
     const unsigned short port = server.Start();
 
     asio::io_context idle_client_context;
@@ -321,13 +322,15 @@ TEST(HttpServerAsyncSessionTest, IdleClientDoesNotBlockACompleteRequestOnOneIoTh
     idle_client.close(ignored_error);
 }
 
-TEST(HttpServerAsyncSessionTest, MultipleIoWorkersRunIndependentSessionHandlersConcurrently) {
+TEST(HttpServerBusinessIsolationTest, ConfiguredHandlerWorkersExecuteConcurrentlyWithOneIoWorker) {
     std::atomic_size_t active_handlers{0};
     std::atomic_size_t maximum_active_handlers{0};
 
     agent::HttpServerOptions options;
     options.port = 0;
-    options.io_thread_count = 4;
+    options.io_thread_count = 1;
+    options.handler_thread_count = 4;
+    options.max_in_flight_requests = 8;
 
     agent::HttpServer server(options, [&](const agent::HttpRequest&) {
         const std::size_t active = active_handlers.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -340,19 +343,218 @@ TEST(HttpServerAsyncSessionTest, MultipleIoWorkersRunIndependentSessionHandlersC
     const unsigned short port = server.Start();
     const BaselineResult result = RunConcurrentBatch(port, 8);
 
-    std::cout << "[ HTTP ASYNC ] clients=" << result.client_count << " success_rate="
+    std::cout << "[ HTTP HANDLERS ] clients=" << result.client_count << " success_rate="
               << (100.0 * static_cast<double>(result.successful_requests) / static_cast<double>(result.client_count))
               << "% total_ms=" << result.total_milliseconds << " p95_ms=" << result.p95_milliseconds
               << " max_active_handlers=" << maximum_active_handlers.load(std::memory_order_relaxed) << '\n';
 
     EXPECT_EQ(result.successful_requests, 8U);
     EXPECT_GE(maximum_active_handlers.load(std::memory_order_relaxed), 2U);
+    EXPECT_LE(maximum_active_handlers.load(std::memory_order_relaxed), options.handler_thread_count);
 
     server.RequestStop();
     server.Wait();
 }
 
-TEST(HttpServerBaselineTest, RecordsSerialServerConcurrencyBaseline) {
+TEST(HttpServerBusinessIsolationTest, HandlerExceptionReturnsErrorAndDoesNotTerminateWorker) {
+    std::atomic_size_t handler_calls{0};
+
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.io_thread_count = 1;
+    options.handler_thread_count = 1;
+
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        if (handler_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+            throw std::runtime_error("simulated handler failure");
+        }
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    const agent::HttpResponse failed_response = SendGetRequest(port, "/handler-failure");
+    const agent::HttpResponse successful_response = SendGetRequest(port, "/after-handler-failure");
+
+    EXPECT_EQ(failed_response.result(), http::status::internal_server_error);
+    EXPECT_NE(failed_response.body().find("simulated handler failure"), std::string::npos);
+    EXPECT_EQ(successful_response.result(), http::status::ok);
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 2U);
+
+    server.RequestStop();
+    server.Wait();
+}
+
+TEST(HttpServerBackpressureTest, SaturatedExecutorReturnsServiceUnavailableWithoutBlockingIo) {
+    std::mutex handler_mutex;
+    std::condition_variable handler_condition;
+    bool release_handler = false;
+    std::atomic_bool handler_started{false};
+    std::atomic_size_t handler_calls{0};
+
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.io_thread_count = 1;
+    options.handler_thread_count = 1;
+    options.max_connections = 8;
+    options.max_in_flight_requests = 1;
+
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::unique_lock lock(handler_mutex);
+            handler_started.store(true, std::memory_order_release);
+            handler_condition.notify_all();
+            handler_condition.wait(lock, [&] { return release_handler; });
+        }
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    std::optional<agent::HttpResponse> first_response;
+    std::exception_ptr first_request_error;
+    std::thread first_client([&] {
+        try {
+            first_response = SendGetRequest(port, "/slow");
+        } catch (...) {
+            first_request_error = std::current_exception();
+        }
+    });
+
+    const bool started = WaitUntil([&] { return handler_started.load(std::memory_order_acquire); }, kConditionTimeout);
+    if (!started) {
+        {
+            std::scoped_lock lock(handler_mutex);
+            release_handler = true;
+        }
+        handler_condition.notify_all();
+        first_client.join();
+        server.RequestStop();
+        server.Wait();
+        FAIL() << "the first handler did not start";
+        return;
+    }
+
+    const auto overload_started_at = std::chrono::steady_clock::now();
+    const agent::HttpResponse overload_response = SendGetRequest(port, "/overload");
+    const auto overload_elapsed = std::chrono::steady_clock::now() - overload_started_at;
+
+    EXPECT_EQ(overload_response.result(), http::status::service_unavailable);
+    EXPECT_EQ(overload_response[http::field::retry_after], "1");
+    EXPECT_NE(overload_response.body().find("server_overloaded"), std::string::npos);
+    EXPECT_LT(overload_elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1U);
+
+    {
+        std::scoped_lock lock(handler_mutex);
+        release_handler = true;
+    }
+    handler_condition.notify_all();
+    first_client.join();
+
+    EXPECT_EQ(first_request_error, nullptr);
+    ASSERT_TRUE(first_response.has_value());
+    EXPECT_EQ(first_response->result(), http::status::ok);
+
+    server.RequestStop();
+    server.Wait();
+}
+
+TEST(HttpServerBackpressureTest, ShutdownCancelsQueuedWorkAndWaitsForRunningHandler) {
+    std::mutex handler_mutex;
+    std::condition_variable handler_condition;
+    bool release_handler = false;
+    std::atomic_bool handler_started{false};
+    std::atomic_size_t handler_calls{0};
+
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.io_thread_count = 1;
+    options.handler_thread_count = 1;
+    options.max_connections = 8;
+    options.max_in_flight_requests = 2;
+
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::unique_lock lock(handler_mutex);
+            handler_started.store(true, std::memory_order_release);
+            handler_condition.notify_all();
+            handler_condition.wait(lock, [&] { return release_handler; });
+        }
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    std::thread first_client([&] {
+        try {
+            static_cast<void>(SendGetRequest(port, "/running"));
+        } catch (const std::exception&) {}
+    });
+
+    const bool started = WaitUntil([&] { return handler_started.load(std::memory_order_acquire); }, kConditionTimeout);
+    if (!started) {
+        {
+            std::scoped_lock lock(handler_mutex);
+            release_handler = true;
+        }
+        handler_condition.notify_all();
+        first_client.join();
+        server.RequestStop();
+        server.Wait();
+        FAIL() << "the running handler did not start";
+        return;
+    }
+
+    std::thread queued_client([&] {
+        try {
+            static_cast<void>(SendGetRequest(port, "/queued"));
+        } catch (const std::exception&) {}
+    });
+
+    const bool queued = WaitUntil([&] { return server.InFlightRequestCount() == 2; }, kConditionTimeout);
+    if (!queued) {
+        {
+            std::scoped_lock lock(handler_mutex);
+            release_handler = true;
+        }
+        handler_condition.notify_all();
+        first_client.join();
+        queued_client.join();
+        server.RequestStop();
+        server.Wait();
+        FAIL() << "the second request was not queued";
+        return;
+    }
+
+    server.RequestStop();
+    std::atomic_bool wait_completed{false};
+    std::thread waiter([&] {
+        server.Wait();
+        wait_completed.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(wait_completed.load(std::memory_order_acquire));
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(server.InFlightRequestCount(), 1U);
+
+    {
+        std::scoped_lock lock(handler_mutex);
+        release_handler = true;
+    }
+    handler_condition.notify_all();
+
+    first_client.join();
+    queued_client.join();
+    waiter.join();
+
+    EXPECT_TRUE(wait_completed.load(std::memory_order_acquire));
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1U);
+    EXPECT_EQ(server.InFlightRequestCount(), 0U);
+    EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
+}
+
+TEST(HttpServerBaselineTest, RecordsConcurrencyBaseline) {
     RunningHttpServer server([](const agent::HttpRequest&) {
         std::this_thread::sleep_for(kSimulatedHandlerWork);
         return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");

@@ -1,5 +1,6 @@
 #include "agent/api/http_server.h"
 
+#include "bounded_request_executor.h"
 #include "http_session.h"
 
 #include <boost/asio/error.hpp>
@@ -65,6 +66,9 @@ unsigned short HttpServer::Start() {
 
     try {
         const unsigned short port = PrepareAcceptor();
+        request_executor_ =
+            std::make_shared<BoundedRequestExecutor>(options_.handler_thread_count, options_.max_in_flight_requests);
+        request_executor_->Start();
         work_guard_.emplace(io_context_.get_executor());
         io_workers_.reserve(options_.io_thread_count);
 
@@ -87,11 +91,19 @@ unsigned short HttpServer::Start() {
         const std::exception_ptr start_error = std::current_exception();
 
         stop_requested_.store(true, std::memory_order_release);
+        if (request_executor_ != nullptr) {
+            request_executor_->RequestStop();
+        }
         work_guard_.reset();
         io_context_.stop();
 
+        const std::shared_ptr<BoundedRequestExecutor> request_executor = request_executor_;
         std::vector<std::thread> workers_to_join = std::move(io_workers_);
         lock.unlock();
+
+        if (request_executor != nullptr) {
+            request_executor->Wait();
+        }
 
         for (std::thread& worker : workers_to_join) {
             if (worker.joinable()) {
@@ -103,6 +115,7 @@ unsigned short HttpServer::Start() {
         CloseAcceptor();
         running_io_workers_.store(0, std::memory_order_release);
         bound_port_.store(0, std::memory_order_release);
+        request_executor_.reset();
         state_ = HttpServerState::kStopped;
         lifecycle_condition_.notify_all();
         std::rethrow_exception(start_error);
@@ -111,6 +124,7 @@ unsigned short HttpServer::Start() {
 
 void HttpServer::RequestStop() noexcept {
     bool schedule_stop = false;
+    std::shared_ptr<BoundedRequestExecutor> request_executor;
 
     {
         std::scoped_lock lock(lifecycle_mutex_);
@@ -125,6 +139,11 @@ void HttpServer::RequestStop() noexcept {
         }
 
         stop_requested_.store(true, std::memory_order_release);
+        request_executor = request_executor_;
+    }
+
+    if (request_executor != nullptr) {
+        request_executor->RequestStop();
     }
 
     if (schedule_stop) {
@@ -140,6 +159,7 @@ void HttpServer::RequestStop() noexcept {
 
 void HttpServer::Wait() {
     std::vector<std::thread> workers_to_join;
+    std::shared_ptr<BoundedRequestExecutor> request_executor;
 
     {
         std::unique_lock lock(lifecycle_mutex_);
@@ -148,6 +168,10 @@ void HttpServer::Wait() {
             if (worker.joinable() && worker.get_id() == std::this_thread::get_id()) {
                 throw std::logic_error("HTTP server I/O worker cannot wait for itself");
             }
+        }
+
+        if (request_executor_ != nullptr && request_executor_->IsWorkerThread()) {
+            throw std::logic_error("HTTP request handler worker cannot wait for itself");
         }
 
         lifecycle_condition_.wait(lock, [this] { return !wait_in_progress_; });
@@ -163,7 +187,19 @@ void HttpServer::Wait() {
         }
 
         wait_in_progress_ = true;
+        request_executor = request_executor_;
         workers_to_join = std::move(io_workers_);
+    }
+
+    if (request_executor != nullptr) {
+        request_executor->Wait();
+    }
+
+    try {
+        asio::post(acceptor_.get_executor(), [this] { work_guard_.reset(); });
+    } catch (...) {
+        work_guard_.reset();
+        io_context_.stop();
     }
 
     for (std::thread& worker : workers_to_join) {
@@ -186,6 +222,7 @@ void HttpServer::Wait() {
         io_context_.stop();
         running_io_workers_.store(0, std::memory_order_release);
         bound_port_.store(0, std::memory_order_release);
+        request_executor_.reset();
         state_ = HttpServerState::kStopped;
         wait_in_progress_ = false;
         worker_error = worker_error_;
@@ -214,6 +251,16 @@ const HttpServerOptions& HttpServer::Options() const noexcept {
 std::size_t HttpServer::ActiveSessionCount() const noexcept {
     std::scoped_lock lock(sessions_mutex_);
     return sessions_.size();
+}
+
+std::size_t HttpServer::InFlightRequestCount() const noexcept {
+    std::shared_ptr<BoundedRequestExecutor> request_executor;
+    {
+        std::scoped_lock lock(lifecycle_mutex_);
+        request_executor = request_executor_;
+    }
+
+    return request_executor != nullptr ? request_executor->InFlightCount() : 0;
 }
 
 void HttpServer::Run(const std::function<bool()>& stop_requested) {
@@ -328,7 +375,7 @@ void HttpServer::StartAccept() {
 void HttpServer::HandleAccept(const beast::error_code& error, tcp::socket socket) {
     if (!error && !stop_requested_.load(std::memory_order_acquire)) {
         auto session = std::make_shared<HttpSession>(
-            std::move(socket), options_, handler_,
+            std::move(socket), options_, handler_, request_executor_,
             [this](const std::shared_ptr<HttpSession>& closed_session) { RemoveSession(closed_session); });
 
         if (RegisterSession(session)) {
@@ -375,8 +422,6 @@ void HttpServer::StopOnIoContext() noexcept {
     for (const std::shared_ptr<HttpSession>& session : sessions) {
         session->RequestStop();
     }
-
-    work_guard_.reset();
 }
 
 void HttpServer::RunIoContext() noexcept {

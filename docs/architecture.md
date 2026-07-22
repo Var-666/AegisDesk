@@ -5,6 +5,7 @@ flowchart LR
     Desktop["Qt Desktop\nservice controls and diagnostics"]
     Listener["Async HTTP Listener\nacceptor strand"]
     Session["HTTP Sessions\nper-connection strand"]
+    Executor["Bounded Request Executor\nfixed workers + backpressure"]
     API["HTTP JSON API\nbackward-compatible v1 fields"]
     Registry["Service Registry\nconfig and ownership"]
     Supervisor["Process Supervisor\nstate + desired state"]
@@ -17,7 +18,8 @@ flowchart LR
 
     Desktop <-->|"GET / POST"| Listener
     Listener --> Session
-    Session --> API
+    Session --> Executor
+    Executor --> API
     API --> Registry
     Registry --> Supervisor
     Supervisor --> Handshake
@@ -41,6 +43,8 @@ flowchart LR
 | HTTP accept lifecycle | Listener strand + asynchronous accept |
 | Per-connection I/O | Session-owned strand + asynchronous read/write |
 | Active connection ownership | Server session registry |
+| Business request execution | Fixed Handler workers; never runs on I/O workers |
+| Request backpressure | Bounded in-flight counter covering running and queued tasks; overflow returns HTTP 503 |
 | Registry topology | Startup load, then immutable concurrent reads |
 | Start/stop/restart serialization | Per-service operation mutex |
 | Lifecycle snapshot | Per-service state mutex |
