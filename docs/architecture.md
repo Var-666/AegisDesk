@@ -3,6 +3,8 @@
 ```mermaid
 flowchart LR
     Desktop["Qt Desktop\nservice controls and diagnostics"]
+    Listener["Async HTTP Listener\nacceptor strand"]
+    Session["HTTP Sessions\nper-connection strand"]
     API["HTTP JSON API\nbackward-compatible v1 fields"]
     Registry["Service Registry\nconfig and ownership"]
     Supervisor["Process Supervisor\nstate + desired state"]
@@ -13,7 +15,9 @@ flowchart LR
     Health["Health / Alerts"]
     Recovery["Recovery Manager\nbackoff + restart budget"]
 
-    Desktop <-->|"GET / POST"| API
+    Desktop <-->|"GET / POST"| Listener
+    Listener --> Session
+    Session --> API
     API --> Registry
     Registry --> Supervisor
     Supervisor --> Handshake
@@ -34,6 +38,9 @@ flowchart LR
 | Concern | Owner |
 | --- | --- |
 | API request reentrancy | Stateless `AgentApi`; no global request mutex |
+| HTTP accept lifecycle | Listener strand + asynchronous accept |
+| Per-connection I/O | Session-owned strand + asynchronous read/write |
+| Active connection ownership | Server session registry |
 | Registry topology | Startup load, then immutable concurrent reads |
 | Start/stop/restart serialization | Per-service operation mutex |
 | Lifecycle snapshot | Per-service state mutex |

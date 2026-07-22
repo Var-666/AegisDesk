@@ -2,6 +2,7 @@
 
 #include "agent/api/http_json.h"
 
+#include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
 
@@ -11,11 +12,17 @@
 #include <cstddef>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace aegis::agent {
+
+class HttpSession;
 
 enum class HttpServerState {
     kStopped,
@@ -67,14 +74,24 @@ public:
 
     [[nodiscard]] const HttpServerOptions& Options() const noexcept;
 
+    [[nodiscard]] std::size_t ActiveSessionCount() const noexcept;
+
 private:
     void ValidateOptions() const;
 
     [[nodiscard]] unsigned short PrepareAcceptor();
 
-    void AcceptLoop() noexcept;
+    void StartAccept();
 
-    void HandleSession(boost::asio::ip::tcp::socket socket) const;
+    void HandleAccept(const boost::system::error_code& error, boost::asio::ip::tcp::socket socket);
+
+    [[nodiscard]] bool RegisterSession(const std::shared_ptr<HttpSession>& session);
+
+    void RemoveSession(const std::shared_ptr<HttpSession>& session) noexcept;
+
+    void StopOnIoContext() noexcept;
+
+    void RunIoContext() noexcept;
 
     void CloseAcceptor() noexcept;
 
@@ -84,18 +101,24 @@ private:
     HttpServerOptions options_;
     RequestHandler handler_;
     boost::asio::io_context io_context_{-1};
-    boost::asio::ip::tcp::acceptor acceptor_{io_context_};
+    boost::asio::ip::tcp::acceptor acceptor_;
+
+    using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
+    std::optional<WorkGuard> work_guard_;
 
     std::atomic<unsigned short> bound_port_{0};
     std::atomic_bool stop_requested_{false};
+    std::atomic_size_t running_io_workers_{0};
+
+    mutable std::mutex sessions_mutex_;
+    std::unordered_set<std::shared_ptr<HttpSession>> sessions_;
 
     mutable std::mutex lifecycle_mutex_;
     std::condition_variable lifecycle_condition_;
     HttpServerState state_{HttpServerState::kStopped};
-    bool worker_finished_{true};
     bool wait_in_progress_{false};
     std::exception_ptr worker_error_;
-    std::thread worker_;
+    std::vector<std::thread> io_workers_;
 };
 
 } // namespace aegis::agent

@@ -33,6 +33,7 @@ using tcp = asio::ip::tcp;
 
 constexpr auto kClientTimeout = std::chrono::seconds(5);
 constexpr auto kSimulatedHandlerWork = std::chrono::milliseconds(10);
+constexpr auto kConditionTimeout = std::chrono::seconds(3);
 
 class RunningHttpServer {
 public:
@@ -88,6 +89,26 @@ agent::HttpResponse SendGetRequest(const unsigned short port, const std::string&
     beast::error_code ignored_error;
     stream.socket().shutdown(tcp::socket::shutdown_both, ignored_error);
     return response;
+}
+
+template <typename Predicate> bool WaitUntil(Predicate&& predicate, const std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    return predicate();
+}
+
+void UpdateMaximum(std::atomic_size_t& maximum, const std::size_t candidate) {
+    std::size_t observed = maximum.load(std::memory_order_relaxed);
+    while (candidate > observed
+           && !maximum.compare_exchange_weak(observed, candidate, std::memory_order_relaxed,
+                                             std::memory_order_relaxed)) {}
 }
 
 struct BaselineResult {
@@ -262,6 +283,73 @@ TEST(HttpServerLifecycleTest, RunRemainsACompatibleBlockingEntryPoint) {
     EXPECT_NE(port, 0);
     EXPECT_EQ(server.State(), agent::HttpServerState::kStopped);
     EXPECT_EQ(server.BoundPort(), 0);
+}
+
+TEST(HttpServerAsyncSessionTest, IdleClientDoesNotBlockACompleteRequestOnOneIoThread) {
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.io_thread_count = 1;
+    options.read_timeout = std::chrono::seconds(5);
+
+    agent::HttpServer server(
+        options,
+        [](const agent::HttpRequest&) { return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})"); });
+    const unsigned short port = server.Start();
+
+    asio::io_context idle_client_context;
+    tcp::socket idle_client(idle_client_context);
+    idle_client.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
+
+    ASSERT_TRUE(WaitUntil([&] { return server.ActiveSessionCount() == 1; }, kConditionTimeout));
+
+    const auto request_started_at = std::chrono::steady_clock::now();
+    const agent::HttpResponse response = SendGetRequest(port, "/while-idle-client-is-connected");
+    const auto request_elapsed = std::chrono::steady_clock::now() - request_started_at;
+
+    EXPECT_EQ(response.result(), http::status::ok);
+    EXPECT_LT(request_elapsed, std::chrono::seconds(1));
+
+    const auto stop_started_at = std::chrono::steady_clock::now();
+    server.RequestStop();
+    server.Wait();
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started_at;
+
+    EXPECT_LT(stop_elapsed, std::chrono::seconds(1));
+    EXPECT_EQ(server.ActiveSessionCount(), 0U);
+
+    beast::error_code ignored_error;
+    idle_client.close(ignored_error);
+}
+
+TEST(HttpServerAsyncSessionTest, MultipleIoWorkersRunIndependentSessionHandlersConcurrently) {
+    std::atomic_size_t active_handlers{0};
+    std::atomic_size_t maximum_active_handlers{0};
+
+    agent::HttpServerOptions options;
+    options.port = 0;
+    options.io_thread_count = 4;
+
+    agent::HttpServer server(options, [&](const agent::HttpRequest&) {
+        const std::size_t active = active_handlers.fetch_add(1, std::memory_order_acq_rel) + 1;
+        UpdateMaximum(maximum_active_handlers, active);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        active_handlers.fetch_sub(1, std::memory_order_acq_rel);
+        return agent::MakeJsonResponse(http::status::ok, R"({"status":"ok"})");
+    });
+
+    const unsigned short port = server.Start();
+    const BaselineResult result = RunConcurrentBatch(port, 8);
+
+    std::cout << "[ HTTP ASYNC ] clients=" << result.client_count << " success_rate="
+              << (100.0 * static_cast<double>(result.successful_requests) / static_cast<double>(result.client_count))
+              << "% total_ms=" << result.total_milliseconds << " p95_ms=" << result.p95_milliseconds
+              << " max_active_handlers=" << maximum_active_handlers.load(std::memory_order_relaxed) << '\n';
+
+    EXPECT_EQ(result.successful_requests, 8U);
+    EXPECT_GE(maximum_active_handlers.load(std::memory_order_relaxed), 2U);
+
+    server.RequestStop();
+    server.Wait();
 }
 
 TEST(HttpServerBaselineTest, RecordsSerialServerConcurrencyBaseline) {
