@@ -5,11 +5,13 @@
 #include "agent/service/service_registry.h"
 
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -219,11 +221,18 @@ int main(int argc, char* argv[]) {
             },
             [&api](const aegis::agent::HttpRequest& request) { return api.Handle(request); });
 
-        std::cout << "AegisDesk Agent listening on http://127.0.0.1:" << options->port << '\n';
+        const unsigned short bound_port = server.Start();
+
+        std::cout << "AegisDesk Agent listening on http://127.0.0.1:" << bound_port << '\n';
         std::cout << "service config: " << *config_path << '\n';
         std::cout << "path base directory: " << *work_dir << '\n';
 
-        server.Run([] { return g_stop_requested != 0; });
+        while (g_stop_requested == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        server.RequestStop();
+        server.Wait();
     } catch (const std::exception& exception) {
         std::cerr << "[agent] fatal error: " << exception.what() << '\n';
         exit_code = 1;

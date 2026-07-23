@@ -148,8 +148,6 @@ std::vector<AlertEvent> AlertManager::GetRecentResolvedAlerts(const std::size_t 
 
     result.reserve(count);
 
-    // recent_resolved_alerts_ 是旧 -> 新。
-    // 返回时按新 -> 旧，更适合 UI 展示。
     for (std::size_t index = 0; index < count; ++index) {
         const std::size_t reverse_index = recent_resolved_alerts_.size() - 1 - index;
 
@@ -206,7 +204,7 @@ bool AlertManager::HasActiveAlert(const std::string_view service_id, const std::
 
     return active_alerts_.contains(MakeAlertEventId(service_id, rule_id));
 }
-bool AlertManager::Acknowledge(const std::string_view alert_id) {
+std::optional<AlertEvent> AlertManager::AcknowledgeAndGet(const std::string_view alert_id) {
     std::scoped_lock lock(mutex_);
 
     const std::string id(alert_id);
@@ -215,17 +213,20 @@ bool AlertManager::Acknowledge(const std::string_view alert_id) {
 
     if (active_iterator != active_alerts_.end()) {
         active_iterator->second.acknowledged = true;
-        return true;
+        return active_iterator->second;
     }
 
     for (AlertEvent& event : recent_resolved_alerts_) {
         if (event.id == alert_id) {
             event.acknowledged = true;
-            return true;
+            return event;
         }
     }
 
-    return false;
+    return std::nullopt;
+}
+bool AlertManager::Acknowledge(const std::string_view alert_id) {
+    return AcknowledgeAndGet(alert_id).has_value();
 }
 void AlertManager::ForgetService(const std::string_view service_id) {
     std::scoped_lock lock(mutex_);

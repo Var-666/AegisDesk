@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  push:
   pull_request:
 
 permissions:
@@ -46,6 +45,22 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      - name: Generate HTTP performance report
+        if: matrix.build_type == 'Release'
+        run: |
+          ./build/tests/aegis_http_benchmark \
+            --output "build/http-performance-${{ runner.os }}.md" \
+            --repetitions 3
+          cat "build/http-performance-${{ runner.os }}.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload HTTP performance report
+        if: matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-performance-${{ runner.os }}
+          path: build/http-performance-${{ runner.os }}.md
+          if-no-files-found: error
+
   sanitizers:
     name: Linux / ${{ matrix.sanitizer }}
     runs-on: ubuntu-24.04
@@ -75,8 +90,11 @@ jobs:
           -DBUILD_TESTING=ON
           ${{ matrix.cmake_flags }}
 
-      - name: Build core tests
-        run: cmake --build build --target aegis_agent_core_tests --parallel 4
+      - name: Build test targets
+        run: >-
+          cmake --build build
+          --target aegis_agent_core_tests aegis_http_server_tests aegis_http_performance_tests
+          --parallel 4
 
       - name: Run sanitizer tests
         run: ${{ matrix.runtime_options }} ctest --test-dir build --output-on-failure

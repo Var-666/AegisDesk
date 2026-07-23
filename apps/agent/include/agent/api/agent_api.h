@@ -16,16 +16,16 @@ class AgentApi {
 public:
     AgentApi(ServiceRegistry& registry, MetricsCollector& metrics_collector, HealthMonitor& health_monitor);
 
-    [[nodiscard]] HttpResponse Handle(const HttpRequest& request);
+    [[nodiscard]] HttpResponse Handle(const HttpRequest& request) const;
 
 private:
     [[nodiscard]] HttpResponse MakeServiceListResponse() const;
 
-    [[nodiscard]] HttpResponse MakeStatusResponse(ProcessSupervisor& supervisor);
+    [[nodiscard]] HttpResponse MakeStatusResponse(const ProcessSupervisor& supervisor) const;
 
-    [[nodiscard]] HttpResponse MakeActionResponse(ProcessSupervisor& supervisor, std::string_view action);
+    [[nodiscard]] HttpResponse MakeActionResponse(ProcessSupervisor& supervisor, std::string_view action) const;
 
-    [[nodiscard]] HttpResponse MakeLogsResponse(const ProcessSupervisor& supervisor, std::size_t tail);
+    [[nodiscard]] HttpResponse MakeLogsResponse(const ProcessSupervisor& supervisor, std::size_t tail) const;
 
     [[nodiscard]] HttpResponse MakeMetricsResponse(const ProcessSupervisor& supervisor) const;
 
@@ -47,7 +47,7 @@ private:
 
     [[nodiscard]] HttpResponse MakeAllRecoveryEventsResponse(std::size_t limit) const;
 
-    [[nodiscard]] HttpResponse MakeMethodNotAllowed(std::string_view allow);
+    [[nodiscard]] static HttpResponse MakeMethodNotAllowed(std::string_view allow);
 
     ServiceRegistry& registry_;
     MetricsCollector& metrics_collector_;
