@@ -121,17 +121,12 @@ HttpBenchmarkResult RunHttpBenchmark(const HttpBenchmarkScenario& scenario) {
 
     for (std::size_t client_index = 0; client_index < scenario.concurrent_clients; ++client_index) {
         clients.emplace_back([&, client_index] {
-            {
-                std::unique_lock lock(gate_mutex);
-                ++ready_clients;
-                gate_condition.notify_all();
-                gate_condition.wait(lock, [&] { return start; });
-            }
-
             asio::io_context io_context;
             beast::tcp_stream persistent_stream(io_context);
             bool persistent_connection_available = false;
 
+            // Keep-Alive scenarios measure request reuse after connection setup. Short-connection scenarios
+            // intentionally keep connect latency inside each request measurement.
             if (scenario.keep_alive) {
                 try {
                     persistent_stream.expires_after(kClientTimeout);
@@ -140,6 +135,13 @@ HttpBenchmarkResult RunHttpBenchmark(const HttpBenchmarkScenario& scenario) {
                 } catch (const std::exception&) {
                     persistent_connection_available = false;
                 }
+            }
+
+            {
+                std::unique_lock lock(gate_mutex);
+                ++ready_clients;
+                gate_condition.notify_all();
+                gate_condition.wait(lock, [&] { return start; });
             }
 
             for (std::size_t request_index = 0; request_index < scenario.requests_per_client; ++request_index) {

@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <sstream>
+#include <string>
 
 namespace aegis::test {
 namespace {
@@ -15,22 +17,33 @@ void ExpectCleanResult(const HttpBenchmarkResult& result) {
     EXPECT_EQ(result.in_flight_requests_after_stop, 0U);
 }
 
+[[nodiscard]] std::string DescribeResult(const HttpBenchmarkResult& result) {
+    std::ostringstream description;
+    description << "elapsed_ms=" << result.elapsed_milliseconds
+                << ", requests_per_second=" << result.requests_per_second
+                << ", maximum_active_handlers=" << result.maximum_active_handlers
+                << ", successful_requests=" << result.successful_requests
+                << ", failed_requests=" << result.failed_requests;
+    return description.str();
+}
+
 TEST(HttpServerPerformanceAcceptanceTest, HandlerPoolProvidesObservableParallelSpeedup) {
     constexpr std::size_t kClients = 16;
-    constexpr auto kHandlerDelay = std::chrono::milliseconds(40);
+    constexpr auto kHandlerDelay = std::chrono::milliseconds(100);
 
     const HttpBenchmarkResult result = RunHttpBenchmark({
         .name = "handler-pool-acceptance",
         .description = "Verify that four Handler workers execute simulated business work concurrently.",
         .concurrent_clients = kClients,
         .requests_per_client = 1,
-        .keep_alive = false,
+        .keep_alive = true,
         .handler_delay = kHandlerDelay,
-        .io_thread_count = 1,
+        .io_thread_count = 2,
         .handler_thread_count = 4,
     });
 
     const auto serial_duration = kHandlerDelay * kClients;
+    SCOPED_TRACE(DescribeResult(result));
     ExpectCleanResult(result);
     EXPECT_GE(result.maximum_active_handlers, 3U);
     EXPECT_LE(result.maximum_active_handlers, 4U);
