@@ -1,27 +1,27 @@
-# Process Lifecycle State Machine
+# 进程生命周期状态机
 
-`ServiceState` records what the process is doing now. `DesiredState` independently records the operator's intent, which is what allows recovery to distinguish an abnormal exit from a manual stop.
+`ServiceState` 记录进程当前所处的实际状态，`DesiredState` 独立记录操作者的期望状态。两者分离后，自动恢复逻辑才能准确区分异常退出和手动停止。
 
 ```mermaid
 stateDiagram-v2
     [*] --> Stopped
     Stopped --> Starting: Start / desired=running
-    Exited --> Starting: Start or automatic recovery
-    Failed --> Starting: retry / desired=running
-    Starting --> Running: exec handshake succeeds
-    Starting --> Failed: chdir, redirect, permission, or exec fails
+    Exited --> Starting: Start 或自动恢复
+    Failed --> Starting: 重试 / desired=running
+    Starting --> Running: exec 启动握手成功
+    Starting --> Failed: chdir、重定向、权限或 exec 失败
     Running --> Stopping: Stop / desired=stopped
-    Running --> Stopping: Restart / desired remains running
-    Running --> Exited: process exits or is signaled
-    Stopping --> Stopped: manual Stop completes
-    Stopping --> Starting: Restart stop phase completes
+    Running --> Stopping: Restart / desired 保持 running
+    Running --> Exited: 进程正常退出或因信号退出
+    Stopping --> Stopped: 手动 Stop 完成
+    Stopping --> Starting: Restart 的停止阶段完成
 ```
 
-## Transition rules
+## 状态转换规则
 
-- `Start`, `Stop`, and `Restart` are serialized by the operation mutex.
-- The state mutex protects snapshots only; it is not held while waiting for process exit.
-- `Running` is entered only after the close-on-exec pipe confirms a successful `execv`.
-- One observer thread owns `waitpid` for each running service and publishes the exit result.
-- A manual stop changes `DesiredState` to `stopped`; an abnormal exit leaves it as `running`, enabling policy-driven recovery.
-- Stop targets the process group with `SIGTERM`, then escalates to `SIGKILL` after the deadline.
+- `Start`、`Stop` 和 `Restart` 通过 operation mutex 串行执行。
+- state mutex 只保护状态快照；等待进程退出期间不会持有该锁。
+- 只有 close-on-exec 管道确认 `execv` 成功后，状态才会转换为 `Running`。
+- 每个运行中的服务由一个观察线程独占执行 `waitpid`，并负责发布退出结果。
+- 手动停止会将 `DesiredState` 修改为 `stopped`；异常退出仍保持为 `running`，从而允许恢复策略决定是否重启。
+- 停止操作首先向整个进程组发送 `SIGTERM`，超过期限后升级为 `SIGKILL`。

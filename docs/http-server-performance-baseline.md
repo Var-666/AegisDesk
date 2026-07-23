@@ -118,12 +118,15 @@ cmake --build build --target aegis_http_server_tests --parallel
 ctest --test-dir build -L resilience --output-on-failure
 ```
 
-## 后续验收目标
+## 最终性能验收
 
-后续压测与观测阶段应在相同测试方法下继续记录结果，并满足：
+记录日期：2026-07-23
 
-- 50 个并发请求继续全部成功。
-- 长连接与大量短连接混合场景下进行更长时间的 RSS 趋势观测。
-- Keep-Alive 不破坏背压、公平性和优雅停机语义。
-- 慢连接和耗时业务操作不阻塞其他状态查询。
-- macOS、Linux 和 TSan 测试全部通过。
+最终阶段将“趋势测量”和“CI 门槛”分开：
+
+- `aegis_http_benchmark` 在 Release 构建中运行短连接、Keep-Alive 和模拟 5ms Handler 三种场景，输出吞吐量及 P50/P95/P99。
+- `performance` CTest 标签检查 50 个并发短连接、800 次 Keep-Alive 请求、Handler 线程池并行加速和停止后的资源归零。
+- 固定门槛只使用成功率、相对并行加速和宽松的超时边界；绝对吞吐与延迟只用于同一环境下的版本趋势比较。
+- macOS 和 Linux Release CI 自动把 Benchmark 写入 Job Summary，并上传 Markdown 报告 Artifact。
+
+本机 Release 结果与完整口径见[性能验收报告](http-server-performance-report.md)。
