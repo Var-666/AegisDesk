@@ -92,6 +92,14 @@ async_write
 - 业务执行器达到容量上限时返回 JSON 错误 `server_overloaded`，HTTP 状态为 `503`，不会阻塞 I/O 线程等待队列空间。
 - I/O worker 内部异常由 `Wait()` 传播；析构路径会吞掉异常但仍完成资源回收。
 
+## 韧性测试
+
+`aegis_http_server_tests` 中的 `resilience` 测试组覆盖并发 Keep-Alive、并发停止、半包超时、客户端中途断开、连接容量耗尽与恢复，以及 50 轮生命周期文件描述符回收。该测试组可以独立执行：
+
+```bash
+ctest --test-dir build -L resilience --output-on-failure
+```
+
 ## 当前边界
 
 HTTP 协议层现在支持受限 Keep-Alive、解析限制和有界优雅关闭。Agent 仍定位为本机控制面；TLS、身份认证、权限模型和审计日志不属于当前 HTTP Server 范围。
