@@ -88,3 +88,37 @@ gtest_discover_tests(
         LABELS integration
         TIMEOUT 180
 )
+
+add_library(aegis_http_benchmark_support STATIC
+        performance/http_benchmark_runner.cpp
+        performance/http_benchmark_runner.h
+)
+
+target_include_directories(aegis_http_benchmark_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aegis_http_benchmark_support PUBLIC aegis_agent_http)
+
+add_executable(aegis_http_performance_tests
+        performance/http_server_performance_test.cpp
+)
+
+target_link_libraries(aegis_http_performance_tests PRIVATE aegis_http_benchmark_support GTest::gtest_main)
+
+add_executable(aegis_http_benchmark
+        performance/http_benchmark_main.cpp
+)
+
+target_link_libraries(aegis_http_benchmark PRIVATE aegis_http_benchmark_support)
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(aegis_http_benchmark_support PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aegis_http_performance_tests PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(aegis_http_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+endif ()
+
+gtest_discover_tests(
+        aegis_http_performance_tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES
+        LABELS performance
+        TIMEOUT 180
+)
