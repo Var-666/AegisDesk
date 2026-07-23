@@ -53,6 +53,7 @@ gtest_discover_tests(
 
 add_executable(aegis_http_server_tests
         integration/http_server_baseline_test.cpp
+        integration/http_server_resilience_test.cpp
 )
 
 target_link_libraries(aegis_http_server_tests PRIVATE aegis_agent_http GTest::gtest_main)
@@ -67,6 +68,15 @@ gtest_discover_tests(
         TEST_FILTER "HttpServerBaselineTest.*"
         PROPERTIES
         LABELS baseline
+        TIMEOUT 180
+)
+
+gtest_discover_tests(
+        aegis_http_server_tests
+        DISCOVERY_MODE PRE_TEST
+        TEST_FILTER "HttpServerConcurrencyStressTest.*:HttpServerFaultTest.*:HttpServerResourceTest.*"
+        PROPERTIES
+        LABELS resilience
         TIMEOUT 180
 )
 

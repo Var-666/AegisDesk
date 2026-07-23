@@ -300,9 +300,17 @@ ctest --test-dir build --output-on-failure
 - 并发 Start、Stop、Restart 行为测试。
 - API 兼容字段和启动失败原因回归测试。
 - HTTP Server 随机端口集成测试和并发性能基线。
+- HTTP Server Keep-Alive 并发、并发停机、半包超时、客户端断连和连接容量恢复测试。
+- HTTP Server 50 轮启停与文件描述符回收测试。
 - 100 轮 `Start → Restart → Stop` 生命周期压力测试。
 
 100 轮压力测试会在每轮检查旧 PID 和 PGID 是否已经消失，并确认最终状态恢复为 `Stopped`。
+
+HTTP Server 韧性测试可以通过 CTest 标签独立运行：
+
+```bash
+ctest --test-dir build -L resilience --output-on-failure
+```
 
 ### Sanitizer
 
